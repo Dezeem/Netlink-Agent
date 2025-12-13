@@ -93,8 +93,15 @@ void cli_handle_connection(int fd) {
                 if (de->d_name[0] == '.') continue;
                 iface_info_t *inf = get_iface_by_name(de->d_name);
                 if (!inf) continue;
-                int len = snprintf(line, sizeof(line), "%s up=%d rx=%lu tx=%lu rx_err=%lu tx_err=%lu\n",
-                    inf->ifname, inf->up, inf->rx_bytes, inf->tx_bytes, inf->rx_err, inf->tx_err);
+                int len = snprintf(line, sizeof(line),
+                    "%-8s up=%d ip=%-20s rx=%lu tx=%lu rx_err=%lu tx_err=%lu\n",
+                    inf->ifname,
+                    inf->up,
+                    inf->ip[0] ? inf->ip : "-",
+                    inf->rx_bytes,
+                    inf->tx_bytes,
+                    inf->rx_err,
+                    inf->tx_err);
                 write(conn, line, len);
             }
             closedir(d);

@@ -94,13 +94,25 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
     if (nlh->nlmsg_type == RTM_NEWADDR) {
         log_info("NEWADDR on ifindex=%d family=%d addr=%s", ifindex, family, addr_str[0]?addr_str:"<none>");
         if (addr_str[0]) {
-            update_iface_ip(ifindex, addr_str);
+            iface_info_t *inf = get_iface_by_index(ifindex);
+            if (!inf) {
+                inf = ensure_iface_by_index(ifindex, NULL);
+            }
+            if (inf && addr_str[0]) {
+                update_iface_ip(ifindex, addr_str);
+            }
         }
     } else if (nlh->nlmsg_type == RTM_DELADDR) {
         log_info("DELADDR on ifindex=%d family=%d addr=%s", ifindex, family, addr_str[0]?addr_str:"<none>");
         /* On address delete we might clear IP if matches; simple approach: clear if equal */
         /* parser provides helper to clear if ip matches */
-        update_iface_ip(ifindex, NULL); /* clear stored IP for simplicity */
+        iface_info_t *inf = get_iface_by_index(ifindex);
+        if (!inf) {
+            inf = ensure_iface_by_index(ifindex, NULL);
+        }
+        if (inf && addr_str[0]) {
+            update_iface_ip(ifindex, addr_str);
+        }
     }
 }
 

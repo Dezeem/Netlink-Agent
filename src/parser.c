@@ -43,6 +43,26 @@ void init_iface_table(void) {
     log_info("init_iface_table found %d interfaces", iface_count);
 }
 
+iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname)
+{
+    iface_info_t *inf = get_iface_by_index(ifindex);
+    if (inf) return inf;
+
+    if (iface_count >= MAX_IFACES) return NULL;
+
+    iface_info_t *n = &ifaces[iface_count++];
+    memset(n, 0, sizeof(*n));
+    n->ifindex = ifindex;
+    if (ifname)
+        strncpy(n->ifname, ifname, IFNAMSIZ - 1);
+    else
+        snprintf(n->ifname, IFNAMSIZ, "if%d", ifindex);
+
+    log_info("register iface: %s idx=%d", n->ifname, n->ifindex);
+    return n;
+}
+
+
 iface_info_t *get_iface_by_index(int ifindex) {
     for (int i=0;i<iface_count;i++) if (ifaces[i].ifindex == ifindex) return &ifaces[i];
     return NULL;

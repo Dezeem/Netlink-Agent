@@ -21,5 +21,6 @@ void update_iface_status(int ifindex, int up);
 void update_iface_counters(int ifindex, unsigned long rx_bytes, unsigned long tx_bytes, unsigned long rx_err, unsigned long tx_err);
 void update_iface_ip(int ifindex, const char *ip); /* ip==NULL clears the stored ip */
 void list_interfaces(void);
+iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname);
 
 #endif
