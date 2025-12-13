@@ -28,6 +28,7 @@ void init_iface_table(void) {
         }
         if (found) continue;
         if (iface_count >= MAX_IFACES) break;
+        memset(&ifaces[iface_count], 0, sizeof(iface_info_t));
         strncpy(ifaces[iface_count].ifname, ifa->ifa_name, IFNAMSIZ-1);
         ifaces[iface_count].ifindex = if_nametoindex(ifa->ifa_name);
         ifaces[iface_count].up = (ifa->ifa_flags & IFF_UP) ? 1 : 0;
@@ -35,6 +36,7 @@ void init_iface_table(void) {
         ifaces[iface_count].tx_bytes = 0;
         ifaces[iface_count].rx_err = 0;
         ifaces[iface_count].tx_err = 0;
+        ifaces[iface_count].ip[0] = '\0';
         iface_count++;
     }
     freeifaddrs(ifaddr);
@@ -66,11 +68,24 @@ void update_iface_counters(int ifindex, unsigned long rx_bytes, unsigned long tx
     inf->tx_err = tx_err;
 }
 
+void update_iface_ip(int ifindex, const char *ip) {
+    iface_info_t *inf = get_iface_by_index(ifindex);
+    if (!inf) return;
+    if (ip == NULL) {
+        inf->ip[0] = '\0';
+        log_info("cleared IP for iface %s (idx %d)", inf->ifname, ifindex);
+    } else {
+        strncpy(inf->ip, ip, sizeof(inf->ip)-1);
+        inf->ip[sizeof(inf->ip)-1] = '\0';
+        log_info("updated IP for iface %s (idx %d) -> %s", inf->ifname, ifindex, inf->ip);
+    }
+}
+
 void list_interfaces(void) {
     printf("Interfaces:\n");
     for (int i=0;i<iface_count;i++) {
-        printf("%s idx=%d up=%d rx=%lu tx=%lu rx_err=%lu tx_err=%lu\n",
+        printf("%s idx=%d up=%d ip=%s rx=%lu tx=%lu rx_err=%lu tx_err=%lu\n",
             ifaces[i].ifname, ifaces[i].ifindex, ifaces[i].up,
-            ifaces[i].rx_bytes, ifaces[i].tx_bytes, ifaces[i].rx_err, ifaces[i].tx_err);
+            ifaces[i].ip[0]?ifaces[i].ip:"-", ifaces[i].rx_bytes, ifaces[i].tx_bytes, ifaces[i].rx_err, ifaces[i].tx_err);
     }
 }
