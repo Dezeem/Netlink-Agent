@@ -31,6 +31,48 @@ static struct rtattr *rtattr_get(struct rtattr *tb[], int max, struct rtattr *rt
     return NULL;
 }
 
+static int send_nl_addr_dump_req(int sock)
+{
+    struct {
+        struct nlmsghdr nlh;
+        struct ifaddrmsg ifa;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+
+    req.nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
+    req.nlh.nlmsg_type  = RTM_GETADDR;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq   = time(NULL);
+    req.nlh.nlmsg_pid   = getpid();
+
+    req.ifa.ifa_family = AF_UNSPEC;  /* IPv4 + IPv6 */
+
+    struct sockaddr_nl nladdr = {
+        .nl_family = AF_NETLINK,
+        .nl_pid    = 0,   /* kernel */
+    };
+
+    struct iovec iov = {
+        .iov_base = &req,
+        .iov_len  = req.nlh.nlmsg_len,
+    };
+
+    struct msghdr msg = {
+        .msg_name    = &nladdr,
+        .msg_namelen = sizeof(nladdr),
+        .msg_iov     = &iov,
+        .msg_iovlen  = 1,
+    };
+
+    int ret = sendmsg(sock, &msg, 0);
+    if (ret < 0) {
+        log_err("send RTM_GETADDR failed: %s", strerror(errno));
+    }
+
+    return ret;
+}
+
 /* handle link (RTM_NEWLINK / RTM_DELLINK) */
 static void handle_link_msg(struct nlmsghdr *nlh) {
     struct ifinfomsg *ifi = NLMSG_DATA(nlh);
@@ -181,6 +223,8 @@ int netlink_start(int epoll_fd) {
         return -1;
     }
     log_info("netlink socket started (fd=%d)", nl_sock);
+    log_info("syncing netlink state...");
+    send_nl_addr_dump_req(nl_sock);
     return nl_sock;
 }
 
@@ -194,8 +238,11 @@ void process_netlink_messages(void) {
     ssize_t len;
     while ((len = recvmsg(nl_sock, &msg, 0)) > 0) {
         for (struct nlmsghdr *nlh = (struct nlmsghdr*)buf; NLMSG_OK(nlh, (unsigned int)len); nlh = NLMSG_NEXT(nlh, len)) {
-            if (nlh->nlmsg_type == NLMSG_ERROR || nlh->nlmsg_type == NLMSG_DONE) {
+            if (nlh->nlmsg_type == NLMSG_ERROR) {
                 continue;
+            }
+            if (nlh->nlmsg_type == NLMSG_DONE) {
+                log_info("netlink dump completed");
             }
             switch (nlh->nlmsg_type) {
                 case RTM_NEWLINK:
