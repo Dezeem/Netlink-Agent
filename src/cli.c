@@ -81,31 +81,33 @@ void cli_handle_connection(int fd) {
             // For simplicity call list_interfaces to stdout and also write minimal info
             // Better approach: iterate parser table and write formatted lines
             // We'll implement quick iteration by reusing /sys/class/net
-            DIR *d = opendir("/sys/class/net");
-            if (!d) {
-                write(conn, "no interfaces\n", 14);
-                close(conn);
-                return;
+            if (strncmp(buf, "show interfaces", 15) == 0 ||
+                strncmp(buf, "list", 4) == 0)
+            {
+                iface_info_t *inf = iface_list;
+                char line[512];
+
+                while (inf) {
+                    int len = snprintf(line, sizeof(line),
+                        "%s\t%s\n",
+                        inf->ifname,
+                        inf->up ? "UP" : "DOWN");
+                    write(conn, line, len);
+
+                    for (int i = 0; i < inf->addr_cnt; i++) {
+                        len = snprintf(line, sizeof(line),
+                            "  - %s/%d\n",
+                            inf->addrs[i].addr,
+                            inf->addrs[i].prefixlen);
+                        write(conn, line, len);
+                    }
+
+                    inf = inf->next;
+                }
+                
             }
-            struct dirent *de;
-            char line[512];
-            while ((de = readdir(d)) != NULL) {
-                if (de->d_name[0] == '.') continue;
-                iface_info_t *inf = get_iface_by_name(de->d_name);
-                if (!inf) continue;
-                int len = snprintf(line, sizeof(line),
-                    "%-8s up=%d ip=%-20s rx=%lu tx=%lu rx_err=%lu tx_err=%lu\n",
-                    inf->ifname,
-                    inf->up,
-                    inf->ip[0] ? inf->ip : "-",
-                    inf->rx_bytes,
-                    inf->tx_bytes,
-                    inf->rx_err,
-                    inf->tx_err);
-                write(conn, line, len);
-            }
-            closedir(d);
-        } else {
+        } 
+        else {
             const char *resp = "unknown command\n";
             write(conn, resp, strlen(resp));
         }

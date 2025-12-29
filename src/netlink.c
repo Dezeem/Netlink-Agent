@@ -108,6 +108,7 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
     struct ifaddrmsg *ifa = NLMSG_DATA(nlh);
     int ifindex = ifa->ifa_index;
     int family = ifa->ifa_family; /* AF_INET or AF_INET6 */
+    int prefixlen = ifa->ifa_prefixlen;
 
     struct rtattr *tb[IFA_MAX + 1];
     memset(tb, 0, sizeof(tb));
@@ -116,6 +117,9 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
     rtattr_get(tb, IFA_MAX, rta, len);
 
     char addr_str[INET6_ADDRSTRLEN] = {0};
+    if (ifa->ifa_prefixlen == 0) {
+        return;
+    }
 
     if (tb[IFA_LOCAL]) {
         void *addr = RTA_DATA(tb[IFA_LOCAL]);
@@ -141,7 +145,7 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
                 inf = ensure_iface_by_index(ifindex, NULL);
             }
             if (inf && addr_str[0]) {
-                update_iface_ip(ifindex, addr_str);
+                iface_add_addr(inf, family, addr_str, prefixlen);
             }
         }
     } else if (nlh->nlmsg_type == RTM_DELADDR) {
@@ -153,7 +157,7 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
             inf = ensure_iface_by_index(ifindex, NULL);
         }
         if (inf && addr_str[0]) {
-            update_iface_ip(ifindex, addr_str);
+            iface_del_addr(inf, family, addr_str, prefixlen);
         }
     }
 }

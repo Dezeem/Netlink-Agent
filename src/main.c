@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
             log_err("epoll_wait failed: %s", strerror(errno));
             break;
         }
-        for (int i=0;i<nfds;i++) {
+        for (int i = 0;i<nfds;i++) {
             int fd = events[i].data.fd;
             if (fd == -1) continue;
             if (fd == netlink_fd()) {
