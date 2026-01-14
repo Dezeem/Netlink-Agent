@@ -1,5 +1,5 @@
-# NLAgent
-NLAgent is a Unix-socket-based network interface state monitoring and management tool. It monitors network interface state changes in real time and provides query capabilities via a command-line interface.
+# Netlink-Agent
+Netlink-Agent is a Unix-socket-based network interface state monitoring and management tool. It monitors network interface state changes in real time and provides query capabilities via a command-line interface.
 
 ## Features
 - Monitor network interface state changes (e.g., UP/DOWN).
@@ -7,27 +7,23 @@ NLAgent is a Unix-socket-based network interface state monitoring and management
 - Provide interface status and configuration queries.
 
 ## Installation
-1. Clone the repository (replace <your-repo-url> with the actual repository URL):
+1. Clone the repository:
     ```bash
-    git clone https://github.com/yourusername/nlagent.git
+    git clone git@github.com:Dezeem/Netlink-Agent.git
     ```
 2. Change to the project directory:
     ```bash
-    cd nlagent
+    cd Netlink-Agent
     ```
-3. Install dependencies:
+3. Build the project:
     ```bash
-    go mod tidy
+    make
     ```
-4. Build the project:
-    ```bash
-    go build -o nlagent main.go
-    ```
-
+    
 ## Usage
-1. Start NLAgent:
+1. Start Netlink-Agent:
     ```bash
-    ./nlagent
+    make run
     ```
 2. Connect to the Unix Socket using a command-line tool:
     ```bash
@@ -40,14 +36,20 @@ NLAgent is a Unix-socket-based network interface state monitoring and management
 ```bash
 $ nc -U /tmp/nlagent.sock
 > show interfaces
+=== Network Interfaces (2) ===
 Interface: eth0
-  Status: UP
-  IPs:
-    - 192.168.1.1
-Interface: wlan0
-  Status: DOWN
-  IPs:
-    - None
+  Index: 2, Status: UP
+  Counters: RX=3534918288 TX=2293304849 RX_ERR=0 TX_ERR=0
+  Addresses (3):
+    [1] 10.4.4.10 (IPv4)
+    [2] 192.168.88.123 (IPv4)
+
+Interface: lo
+  Index: 1, Status: UP
+  Counters: RX=147969624 TX=147969624 RX_ERR=0 TX_ERR=0
+  Addresses (2):
+    [1] 127.0.0.1 (IPv4)
+    [2] ::1 (IPv6)
 ```
 
 ## Testing adding and removing IP addresses
