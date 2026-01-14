@@ -12,7 +12,7 @@
 iface_info_t *iface_list = NULL;
 static int iface_count = 0;
 
-/* 链表辅助函数 */
+// list management helper functions
 static iface_info_t *create_iface_node(void) {
     iface_info_t *node = (iface_info_t *)calloc(1, sizeof(iface_info_t));
     if (!node) {
@@ -49,9 +49,9 @@ static iface_info_t *find_iface_by_name(const char *ifname) {
     return NULL;
 }
 
-/* 主功能函数 */
+// main functions
 void init_iface_table(void) {
-    // 清理现有链表
+    // cleanup existing list
     free_iface_list();
     
     struct ifaddrs *ifaddr, *ifa;
@@ -60,21 +60,21 @@ void init_iface_table(void) {
         return;
     }
     
-    // 第一次遍历：收集所有接口
+    // the first pass: create iface nodes
     for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_name) continue;
         
-        // 检查是否已存在
+        // check if already exists
         if (find_iface_by_name(ifa->ifa_name)) continue;
         
-        // 创建新节点
+        // create new node
         iface_info_t *new_iface = create_iface_node();
         if (!new_iface) {
             log_err("Failed to create iface node for %s", ifa->ifa_name);
             continue;
         }
         
-        // 初始化接口基本信息
+        // initialize iface basic info
         strncpy(new_iface->ifname, ifa->ifa_name, IFNAMSIZ - 1);
         new_iface->ifname[IFNAMSIZ - 1] = '\0';
         new_iface->ifindex = if_nametoindex(ifa->ifa_name);
@@ -85,20 +85,20 @@ void init_iface_table(void) {
         new_iface->tx_err = 0;
         new_iface->addr_cnt = 0;
         
-        // 添加到链表头部
+        // add to the head of the list
         new_iface->next = iface_list;
         iface_list = new_iface;
         iface_count++;
     }
     
-    // 第二次遍历：收集IP地址
+    // the second pass: collect IP addresses
     for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_name || !ifa->ifa_addr) continue;
         
         iface_info_t *iface = find_iface_by_name(ifa->ifa_name);
         if (!iface) continue;
         
-        // 获取IP地址
+        // get IP address
         char addr_str[INET6_ADDRSTRLEN] = {0};
         int family = ifa->ifa_addr->sa_family;
         int prefix_len = 0;
@@ -126,7 +126,7 @@ iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname) {
     iface_info_t *inf = get_iface_by_index(ifindex);
     if (inf) return inf;
     
-    // 创建新接口节点
+    // create new iface node
     iface_info_t *new_iface = create_iface_node();
     if (!new_iface) {
         log_err("Failed to create iface node for index %d", ifindex);
@@ -141,14 +141,14 @@ iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname) {
         snprintf(new_iface->ifname, IFNAMSIZ, "if%d", ifindex);
     }
     
-    new_iface->up = 0;  // 默认状态
+    new_iface->up = 0;  // default state
     new_iface->rx_bytes = 0;
     new_iface->tx_bytes = 0;
     new_iface->rx_err = 0;
     new_iface->tx_err = 0;
     new_iface->addr_cnt = 0;
     
-    // 添加到链表头部
+    // add to the head of the list
     new_iface->next = iface_list;
     iface_list = new_iface;
     iface_count++;
@@ -182,12 +182,12 @@ void update_iface_counters(int ifindex, unsigned long rx_bytes, unsigned long tx
     inf->tx_err = tx_err;
 }
 
-/* 更新IP（旧函数，保持兼容性）*/
+/* update IP (old function, for compatibility) */
 void update_iface_ip(int ifindex, const char *ip) {
     iface_info_t *inf = get_iface_by_index(ifindex);
     if (!inf) return;
     
-    // 这里只更新第一个IPv4地址作为主IP（兼容旧代码）
+    // only update the first IPv4 address as the primary IP (for compatibility with old code)
     for (int i = 0; i < inf->addr_cnt; i++) {
         if (inf->addrs[i].family == AF_INET) {
             strncpy(inf->addrs[i].addr, ip, INET6_ADDRSTRLEN - 1);
@@ -198,7 +198,7 @@ void update_iface_ip(int ifindex, const char *ip) {
         }
     }
     
-    // 如果没有IPv4地址，添加一个
+    // if no IPv4 address, add one
     if (inf->addr_cnt < MAX_ADDR_PER_IF) {
         inf->addrs[inf->addr_cnt].family = AF_INET;
         strncpy(inf->addrs[inf->addr_cnt].addr, ip, INET6_ADDRSTRLEN - 1);
@@ -212,24 +212,24 @@ void update_iface_ip(int ifindex, const char *ip) {
 void iface_add_addr(iface_info_t *inf, int family, const char *addr, int prefixlen) {
     if (!inf || !addr || !addr[0]) return;
     
-    // 检查参数有效性
+    // check parameter validity
     if (family != AF_INET && family != AF_INET6) {
         log_warn("Invalid address family: %d", family);
         return;
     }
 
-    // 前缀长度检查
+    // check prefix length
     if(prefixlen == 0) {
         log_info("Prefix length is zero, skipping address addition");
         return;
     }
     
-    // 去重检查
+    // deduplication check
     for (int i = 0; i < inf->addr_cnt; i++) {
         if (inf->addrs[i].family == family &&
             inf->addrs[i].prefixlen == prefixlen &&
             strcmp(inf->addrs[i].addr, addr) == 0) {
-            return;  // 地址已存在
+            return;  // address already exists
         }
     }
     
@@ -238,7 +238,7 @@ void iface_add_addr(iface_info_t *inf, int family, const char *addr, int prefixl
         return;
     }
     
-    // 添加新地址
+    // add new address
     inf->addrs[inf->addr_cnt].family = family;
     inf->addrs[inf->addr_cnt].prefixlen = prefixlen;
     strncpy(inf->addrs[inf->addr_cnt].addr, addr, INET6_ADDRSTRLEN - 1);
@@ -257,7 +257,7 @@ void iface_del_addr(iface_info_t *inf, int family, const char *addr, int prefixl
             inf->addrs[i].prefixlen == prefixlen &&
             strcmp(inf->addrs[i].addr, addr) == 0) {
             
-            // 移除地址
+            // remove address
             for (int j = i; j < inf->addr_cnt - 1; j++) {
                 inf->addrs[j] = inf->addrs[j + 1];
             }
@@ -293,7 +293,7 @@ void list_interfaces(void) {
     }
 }
 
-/* 新增功能函数 */
+// new helper functions
 void cleanup_iface_table(void) {
     free_iface_list();
     log_info("iface table cleaned up");
@@ -307,7 +307,7 @@ iface_info_t *get_iface_list(void) {
     return iface_list;
 }
 
-/* 删除接口 */
+// delete iface by index
 void delete_iface_by_index(int ifindex) {
     iface_info_t *prev = NULL;
     iface_info_t *current = iface_list;
@@ -332,7 +332,7 @@ void delete_iface_by_index(int ifindex) {
     log_info("iface with index %d not found for deletion", ifindex);
 }
 
-/* 遍历接口的回调函数接口 */
+// iterate over interfaces with a callback
 void foreach_iface(void (*callback)(iface_info_t *iface, void *data), void *data) {
     for (iface_info_t *p = iface_list; p; p = p->next) {
         callback(p, data);

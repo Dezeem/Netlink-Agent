@@ -26,7 +26,7 @@ typedef struct iface_info {
     struct iface_info *next;
 } iface_info_t;
 
-/* 全局接口链表（只读） */
+// global iface list head
 extern iface_info_t *iface_list;
 
 void init_iface_table(void);
@@ -38,7 +38,7 @@ void update_iface_ip(int ifindex, const char *ip); /* ip==NULL clears the stored
 void list_interfaces(void);
 iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname);
 
-/* 地址操作 */
+// addr management functions
 void iface_add_addr(iface_info_t *inf, int family, const char *addr, int prefixlen);
 void iface_del_addr(iface_info_t *inf, int family, const char *addr, int prefixlen);
 

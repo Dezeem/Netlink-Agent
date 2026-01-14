@@ -105,6 +105,7 @@ void cli_handle_connection(int fd) {
                     inf = inf->next;
                 }
                 
+                list_interfaces();
             }
         } 
         else {
