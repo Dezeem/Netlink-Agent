@@ -6,6 +6,13 @@
 #include <stdio.h>
 #include <ifaddrs.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/if_link.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
 
 #define MAX_IFACES 128
 
@@ -353,6 +360,14 @@ static unsigned long read_ull_file(const char *path) {
 int update_iface_performance_data(iface_info_t *iface) {
     if (!iface || !iface->ifname[0]) return -1;
     
+    // First try Netlink method (preferred)
+    if (update_iface_stats_via_netlink(iface) == 0) {
+        return 0;
+    }
+    
+    // Fallback to sysfs method if Netlink fails
+    log_warn("Netlink stats update failed for %s, falling back to sysfs", iface->ifname);
+    
     char rx_path[256], tx_path[256], rxerr_path[256], txerr_path[256];
     snprintf(rx_path, sizeof(rx_path), "/sys/class/net/%s/statistics/rx_bytes", iface->ifname);
     snprintf(tx_path, sizeof(tx_path), "/sys/class/net/%s/statistics/tx_bytes", iface->ifname);
@@ -364,6 +379,12 @@ int update_iface_performance_data(iface_info_t *iface) {
     iface->rx_err = read_ull_file(rxerr_path);
     iface->tx_err = read_ull_file(txerr_path);
     
+    // Also update the new stats structure for consistency
+    iface->stats.rx_bytes = iface->rx_bytes;
+    iface->stats.tx_bytes = iface->tx_bytes;
+    iface->stats.rx_errors = iface->rx_err;
+    iface->stats.tx_errors = iface->tx_err;
+    
     return 0;
 }
 
@@ -371,5 +392,154 @@ int update_iface_performance_data(iface_info_t *iface) {
 void update_all_iface_performance_data(void) {
     for (iface_info_t *p = iface_list; p; p = p->next) {
         update_iface_performance_data(p);
+    }
+}
+
+// Helper function to synchronize legacy statistics fields
+void sync_legacy_stats_fields(iface_info_t *iface) {
+    if (!iface) return;
+    
+    // Sync the legacy fields with the new stats structure
+    iface->rx_bytes = iface->stats.rx_bytes;
+    iface->tx_bytes = iface->stats.tx_bytes;
+    iface->rx_err = iface->stats.rx_errors;
+    iface->tx_err = iface->stats.tx_errors;
+}
+
+// Send Netlink request to get interface statistics
+static int send_netlink_stats_request(int sock, int ifindex) {
+    struct {
+        struct nlmsghdr nlh;
+        struct ifinfomsg ifm;
+        struct rtattr rta;
+        __u32 filter_mask;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+
+    // Netlink message header
+    req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg) + sizeof(struct rtattr) + sizeof(__u32));
+    req.nlh.nlmsg_type = RTM_GETLINK;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST;
+    req.nlh.nlmsg_seq = time(NULL);
+    req.nlh.nlmsg_pid = getpid();
+
+    // Interface information message
+    req.ifm.ifi_family = AF_UNSPEC;
+    req.ifm.ifi_index = ifindex;
+
+    // Statistics filter attribute
+    req.rta.rta_type = IFLA_EXT_MASK;
+    req.rta.rta_len = RTA_LENGTH(sizeof(__u32));
+    req.filter_mask = RTEXT_FILTER_VF;
+
+    struct sockaddr_nl nladdr = {
+        .nl_family = AF_NETLINK,
+        .nl_pid = 0,   // kernel
+    };
+
+    struct iovec iov = {
+        .iov_base = &req,
+        .iov_len = req.nlh.nlmsg_len,
+    };
+
+    struct msghdr msg = {
+        .msg_name = &nladdr,
+        .msg_namelen = sizeof(nladdr),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+    };
+
+    int ret = sendmsg(sock, &msg, 0);
+    if (ret < 0) {
+        log_err("send RTM_GETLINK failed: %s", strerror(errno));
+    }
+
+    return ret;
+}
+
+// Parse Netlink response and update interface statistics
+static int parse_netlink_stats_response(struct nlmsghdr *nlh, iface_info_t *iface) {
+    struct ifinfomsg *ifm = NLMSG_DATA(nlh);
+    
+    // Only process messages for our target interface
+    if (ifm->ifi_index != iface->ifindex) {
+        return 0;
+    }
+
+    // Parse attributes to find statistics
+    struct rtattr *tb[IFLA_MAX + 1];
+    memset(tb, 0, sizeof(tb));
+    struct rtattr *rta = IFLA_RTA(ifm);
+    int len = IFLA_PAYLOAD(nlh);
+    
+    while (RTA_OK(rta, len)) {
+        if (rta->rta_type <= IFLA_MAX) {
+            tb[rta->rta_type] = rta;
+        }
+        rta = RTA_NEXT(rta, len);
+    }
+
+    // Extract statistics if available
+    if (tb[IFLA_STATS64]) {
+        struct rtnl_link_stats64 *stats = RTA_DATA(tb[IFLA_STATS64]);
+        iface->stats = *stats;
+        sync_legacy_stats_fields(iface);
+        return 1;
+    }
+
+    return 0;
+}
+
+// Netlink-based performance data update for a single interface
+int update_iface_stats_via_netlink(iface_info_t *iface) {
+    if (!iface || !iface->ifname[0]) return -1;
+
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        log_err("Netlink socket creation failed: %s", strerror(errno));
+        return -1;
+    }
+
+    // Send request for this interface
+    if (send_netlink_stats_request(sock, iface->ifindex) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    // Read and parse response
+    char buf[4096];
+    struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+    struct msghdr msg = {
+        .msg_name = NULL,
+        .msg_namelen = 0,
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+    };
+
+    int success = 0;
+    ssize_t n = recvmsg(sock, &msg, 0);
+    if (n > 0) {
+        struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+        for (; NLMSG_OK(nlh, n); nlh = NLMSG_NEXT(nlh, n)) {
+            if (nlh->nlmsg_type == RTM_NEWLINK) {
+                if (parse_netlink_stats_response(nlh, iface)) {
+                    success = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    close(sock);
+    return success ? 0 : -1;
+}
+
+// Netlink-based performance data update for all interfaces
+void update_all_iface_stats_via_netlink(void) {
+    // For simplicity, iterate through each interface
+    // In a more optimized implementation, we could batch request all interfaces
+    for (iface_info_t *p = iface_list; p; p = p->next) {
+        update_iface_stats_via_netlink(p);
     }
 }

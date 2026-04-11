@@ -59,59 +59,162 @@ int cli_start(int epoll_fd) {
     return cli_sock;
 }
 
+// Structure to track active CLI connections
+typedef struct {
+    int fd;
+    int epoll_fd;
+} cli_connection_t;
+
+// Send welcome message and prompt
+static void send_welcome_prompt(int conn) {
+    const char *welcome = "=== Netlink Agent CLI ===\n"
+                         "Available commands:\n"
+                         "  show interfaces, list - Display interface status\n"
+                         "  help - Show this help message\n"
+                         "  quit, exit - Close connection\n"
+                         "\n> ";
+    write(conn, welcome, strlen(welcome));
+}
+
+// Send command prompt
+static void send_prompt(int conn) {
+    const char *prompt = "> ";
+    write(conn, prompt, strlen(prompt));
+}
+
+// Handle individual command
+static int handle_command(int conn, const char *command) {
+    if (strncmp(command, "show interfaces", 15) == 0 || strncmp(command, "list", 4) == 0) {
+        iface_info_t *inf = iface_list;
+        char line[512];
+        int total_interfaces = 0;
+
+        // Count interfaces first
+        while (inf) {
+            total_interfaces++;
+            inf = inf->next;
+        }
+
+        // Send header
+        int len = snprintf(line, sizeof(line), "=== Network Interfaces (%d) ===\n", total_interfaces);
+        write(conn, line, len);
+
+        // Send interface details
+        inf = iface_list;
+        while (inf) {
+            len = snprintf(line, sizeof(line),
+                "Interface: %s\n"
+                "  Index: %d, Status: %s\n"
+                "  Counters: RX=%llu TX=%llu RX_ERR=%llu TX_ERR=%llu\n",
+                inf->ifname,
+                inf->ifindex,
+                inf->up ? "UP" : "DOWN",
+                (unsigned long long)inf->stats.rx_bytes,
+                (unsigned long long)inf->stats.tx_bytes,
+                (unsigned long long)inf->stats.rx_errors,
+                (unsigned long long)inf->stats.tx_errors);
+            write(conn, line, len);
+
+            // Send IP addresses
+            if (inf->addr_cnt > 0) {
+                len = snprintf(line, sizeof(line), "  Addresses (%d):\n", inf->addr_cnt);
+                write(conn, line, len);
+                
+                for (int i = 0; i < inf->addr_cnt; i++) {
+                    len = snprintf(line, sizeof(line),
+                        "    [%d] %s/%d (%s)\n",
+                        i + 1,
+                        inf->addrs[i].addr,
+                        inf->addrs[i].prefixlen,
+                        inf->addrs[i].family == AF_INET ? "IPv4" : "IPv6");
+                    write(conn, line, len);
+                }
+            } else {
+                write(conn, "  No addresses\n", 15);
+            }
+            
+            write(conn, "\n", 1);
+            inf = inf->next;
+        }
+        
+        return 0; // Continue session
+    }
+    else if (strncmp(command, "help", 4) == 0) {
+        const char *help = "Available commands:\n"
+                         "  show interfaces, list - Display interface status\n"
+                         "  help - Show this help message\n"
+                         "  quit, exit - Close connection\n";
+        write(conn, help, strlen(help));
+        return 0; // Continue session
+    }
+    else if (strncmp(command, "quit", 4) == 0 || strncmp(command, "exit", 4) == 0) {
+        const char *goodbye = "Goodbye!\n";
+        write(conn, goodbye, strlen(goodbye));
+        return 1; // End session
+    }
+    else {
+        const char *resp = "Unknown command. Type 'help' for available commands.\n";
+        write(conn, resp, strlen(resp));
+        return 0; // Continue session
+    }
+}
+
+// Handle CLI connection with interactive command loop
+static void handle_cli_session(int conn, int epoll_fd) {
+    (void)epoll_fd; // Unused parameter
+    send_welcome_prompt(conn);
+    
+    char buf[256];
+    int session_active = 1;
+    
+    while (session_active) {
+        // Read command from client
+        int n = read(conn, buf, sizeof(buf)-1);
+        if (n <= 0) {
+            // Connection closed or error
+            break;
+        }
+        
+        buf[n] = '\0';
+        
+        // Remove newline characters
+        char *newline = strchr(buf, '\n');
+        if (newline) *newline = '\0';
+        newline = strchr(buf, '\r');
+        if (newline) *newline = '\0';
+        
+        // Skip empty commands
+        if (strlen(buf) == 0) {
+            send_prompt(conn);
+            continue;
+        }
+        
+        // Handle command
+        int should_exit = handle_command(conn, buf);
+        
+        if (should_exit) {
+            session_active = 0;
+        } else {
+            send_prompt(conn);
+        }
+    }
+    
+    close(conn);
+    log_info("CLI session ended for fd %d", conn);
+}
+
 void cli_handle_connection(int fd) {
     if (fd == cli_sock) {
+        // New connection request
         int conn = accept(cli_sock, NULL, NULL);
         if (conn < 0) {
             log_err("accept cli conn failed: %s", strerror(errno));
             return;
         }
-        // read simple command (blocking small read)
-        char buf[256];
-        int n = read(conn, buf, sizeof(buf)-1);
-        if (n <= 0) {
-            close(conn);
-            return;
-        }
-        buf[n] = '\0';
-        // only support "show interfaces\n" or "list\n"
-        if (strncmp(buf, "show interfaces", 15) == 0 || strncmp(buf, "list", 4)==0) {
-            // capture output by writing to socket
-            // We'll duplicate behavior of list_interfaces to socket by simple approach: format lines
-            // For simplicity call list_interfaces to stdout and also write minimal info
-            // Better approach: iterate parser table and write formatted lines
-            // We'll implement quick iteration by reusing /sys/class/net
-            if (strncmp(buf, "show interfaces", 15) == 0 ||
-                strncmp(buf, "list", 4) == 0)
-            {
-                iface_info_t *inf = iface_list;
-                char line[512];
-
-                while (inf) {
-                    int len = snprintf(line, sizeof(line),
-                        "%s\t%s\n",
-                        inf->ifname,
-                        inf->up ? "UP" : "DOWN");
-                    write(conn, line, len);
-
-                    for (int i = 0; i < inf->addr_cnt; i++) {
-                        len = snprintf(line, sizeof(line),
-                            "  - %s/%d\n",
-                            inf->addrs[i].addr,
-                            inf->addrs[i].prefixlen);
-                        write(conn, line, len);
-                    }
-
-                    inf = inf->next;
-                }
-                
-                list_interfaces();
-            }
-        } 
-        else {
-            const char *resp = "unknown command\n";
-            write(conn, resp, strlen(resp));
-        }
-        close(conn);
+        
+        log_info("New CLI connection accepted on fd %d", conn);
+        
+        // Handle the CLI session (this will block until session ends)
+        handle_cli_session(conn, -1); // -1 indicates no epoll registration needed
     }
 }

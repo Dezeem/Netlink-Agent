@@ -2,6 +2,7 @@
 #define PARSER_H
 
 #include <net/if.h>
+#include <linux/if_link.h>  // For struct rtnl_link_stats64
 
 #define MAX_ADDR_PER_IF 8
 #define INET6_ADDRSTRLEN 46
@@ -16,6 +17,11 @@ typedef struct iface_info {
     char ifname[IFNAMSIZ];
     int ifindex;
     int up;
+    
+    // Full Netlink statistics structure
+    struct rtnl_link_stats64 stats;
+    
+    // Legacy fields for backward compatibility
     unsigned long rx_bytes;
     unsigned long tx_bytes;
     unsigned long rx_err;
@@ -49,5 +55,12 @@ int get_iface_count(void);
 // Performance data management functions
 int update_iface_performance_data(iface_info_t *iface);
 void update_all_iface_performance_data(void);
+
+// Netlink-based performance data functions
+int update_iface_stats_via_netlink(iface_info_t *iface);
+void update_all_iface_stats_via_netlink(void);
+
+// Helper functions for statistics synchronization
+void sync_legacy_stats_fields(iface_info_t *iface);
 
 #endif

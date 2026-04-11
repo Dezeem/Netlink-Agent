@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <time.h>
 
 /* netlink socket */
 static int nl_sock = -1;
