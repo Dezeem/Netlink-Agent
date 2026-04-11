@@ -42,4 +42,12 @@ iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname);
 void iface_add_addr(iface_info_t *inf, int family, const char *addr, int prefixlen);
 void iface_del_addr(iface_info_t *inf, int family, const char *addr, int prefixlen);
 
+// SSOT iterator functions
+void foreach_iface(void (*callback)(iface_info_t *iface, void *data), void *data);
+int get_iface_count(void);
+
+// Performance data management functions
+int update_iface_performance_data(iface_info_t *iface);
+void update_all_iface_performance_data(void);
+
 #endif

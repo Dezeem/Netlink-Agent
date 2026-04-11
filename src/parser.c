@@ -338,3 +338,38 @@ void foreach_iface(void (*callback)(iface_info_t *iface, void *data), void *data
         callback(p, data);
     }
 }
+
+// Helper function to read unsigned long from sysfs file
+static unsigned long read_ull_file(const char *path) {
+    unsigned long v = 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    if (fscanf(f, "%lu", &v) != 1) v = 0;
+    fclose(f);
+    return v;
+}
+
+// Update performance data for a single interface
+int update_iface_performance_data(iface_info_t *iface) {
+    if (!iface || !iface->ifname[0]) return -1;
+    
+    char rx_path[256], tx_path[256], rxerr_path[256], txerr_path[256];
+    snprintf(rx_path, sizeof(rx_path), "/sys/class/net/%s/statistics/rx_bytes", iface->ifname);
+    snprintf(tx_path, sizeof(tx_path), "/sys/class/net/%s/statistics/tx_bytes", iface->ifname);
+    snprintf(rxerr_path, sizeof(rxerr_path), "/sys/class/net/%s/statistics/rx_errors", iface->ifname);
+    snprintf(txerr_path, sizeof(txerr_path), "/sys/class/net/%s/statistics/tx_errors", iface->ifname);
+    
+    iface->rx_bytes = read_ull_file(rx_path);
+    iface->tx_bytes = read_ull_file(tx_path);
+    iface->rx_err = read_ull_file(rxerr_path);
+    iface->tx_err = read_ull_file(txerr_path);
+    
+    return 0;
+}
+
+// Update performance data for all interfaces
+void update_all_iface_performance_data(void) {
+    for (iface_info_t *p = iface_list; p; p = p->next) {
+        update_iface_performance_data(p);
+    }
+}
