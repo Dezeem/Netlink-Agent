@@ -1,7 +1,7 @@
 # Makefile for nlagent project
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g
-LDFLAGS =
+LDFLAGS = -lpthread
 
 # directory structure
 SRC_DIR = src

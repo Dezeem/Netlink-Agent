@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <dirent.h>
+#include <stdlib.h>
 
 #define CLI_SOCKET_PATH "/tmp/nlagent.sock"
 static int cli_sock = -1;
@@ -99,8 +100,14 @@ static int handle_command(int conn, const char *command) {
         int len = snprintf(line, sizeof(line), "=== Network Interfaces (%d) ===\n", total_interfaces);
         write(conn, line, len);
 
-        // Send interface details
-        inf = iface_list;
+        // Send interface details using thread-safe copy
+        iface_info_t *safe_list = get_iface_list_safe();
+        if (!safe_list) {
+            write(conn, "Error: Failed to get interface list\n", 35);
+            return 0;
+        }
+        
+        inf = safe_list;
         while (inf) {
             len = snprintf(line, sizeof(line),
                 "Interface: %s\n"
@@ -135,6 +142,14 @@ static int handle_command(int conn, const char *command) {
             
             write(conn, "\n", 1);
             inf = inf->next;
+        }
+        
+        // Free the safe list copy
+        inf = safe_list;
+        while (inf) {
+            iface_info_t *next = inf->next;
+            free(inf);
+            inf = next;
         }
         
         return 0; // Continue session

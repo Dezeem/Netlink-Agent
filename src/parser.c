@@ -19,6 +19,9 @@
 iface_info_t *iface_list = NULL;
 static int iface_count = 0;
 
+// Thread-safe lock for iface_list
+pthread_rwlock_t iface_list_lock = PTHREAD_RWLOCK_INITIALIZER;
+
 // list management helper functions
 static iface_info_t *create_iface_node(void) {
     iface_info_t *node = (iface_info_t *)calloc(1, sizeof(iface_info_t));
@@ -32,6 +35,7 @@ static iface_info_t *create_iface_node(void) {
 }
 
 static void free_iface_list(void) {
+    iface_list_wrlock();
     iface_info_t *current = iface_list;
     while (current) {
         iface_info_t *next = current->next;
@@ -40,6 +44,7 @@ static void free_iface_list(void) {
     }
     iface_list = NULL;
     iface_count = 0;
+    iface_list_unlock();
 }
 
 static iface_info_t *find_iface_by_index(int ifindex) {
@@ -93,9 +98,11 @@ void init_iface_table(void) {
         new_iface->addr_cnt = 0;
         
         // add to the head of the list
+        iface_list_wrlock();
         new_iface->next = iface_list;
         iface_list = new_iface;
         iface_count++;
+        iface_list_unlock();
     }
     
     // the second pass: collect IP addresses
@@ -156,9 +163,11 @@ iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname) {
     new_iface->addr_cnt = 0;
     
     // add to the head of the list
+    iface_list_wrlock();
     new_iface->next = iface_list;
     iface_list = new_iface;
     iface_count++;
+    iface_list_unlock();
     
     log_info("register iface: %s idx=%d", new_iface->ifname, new_iface->ifindex);
     return new_iface;
@@ -280,6 +289,7 @@ void iface_del_addr(iface_info_t *inf, int family, const char *addr, int prefixl
 }
 
 void list_interfaces(void) {
+    iface_list_rdlock();
     printf("=== Network Interfaces (%d) ===\n", iface_count);
     for (iface_info_t *p = iface_list; p; p = p->next) {
         printf("Interface: %s\n", p->ifname);
@@ -298,6 +308,7 @@ void list_interfaces(void) {
         }
         printf("\n");
     }
+    iface_list_unlock();
 }
 
 // new helper functions
@@ -307,15 +318,22 @@ void cleanup_iface_table(void) {
 }
 
 int get_iface_count(void) {
-    return iface_count;
+    int count;
+    iface_list_rdlock();
+    count = iface_count;
+    iface_list_unlock();
+    return count;
 }
 
 iface_info_t *get_iface_list(void) {
+    // Deprecated: Use get_iface_list_safe() instead for thread safety
     return iface_list;
 }
 
 // delete iface by index
 void delete_iface_by_index(int ifindex) {
+    iface_list_wrlock();
+    
     iface_info_t *prev = NULL;
     iface_info_t *current = iface_list;
     
@@ -330,20 +348,24 @@ void delete_iface_by_index(int ifindex) {
             log_info("deleted iface: %s idx=%d", current->ifname, current->ifindex);
             free(current);
             iface_count--;
+            iface_list_unlock();
             return;
         }
         prev = current;
         current = current->next;
     }
     
+    iface_list_unlock();
     log_info("iface with index %d not found for deletion", ifindex);
 }
 
 // iterate over interfaces with a callback
 void foreach_iface(void (*callback)(iface_info_t *iface, void *data), void *data) {
+    iface_list_rdlock();
     for (iface_info_t *p = iface_list; p; p = p->next) {
         callback(p, data);
     }
+    iface_list_unlock();
 }
 
 // Helper function to read unsigned long from sysfs file
@@ -539,7 +561,66 @@ int update_iface_stats_via_netlink(iface_info_t *iface) {
 void update_all_iface_stats_via_netlink(void) {
     // For simplicity, iterate through each interface
     // In a more optimized implementation, we could batch request all interfaces
+    iface_list_rdlock();
     for (iface_info_t *p = iface_list; p; p = p->next) {
         update_iface_stats_via_netlink(p);
+    }
+    iface_list_unlock();
+}
+
+// Thread-safe access functions implementation
+
+// Get a safe copy of the iface list (caller must free after use)
+iface_info_t *get_iface_list_safe(void) {
+    iface_list_rdlock();
+    
+    // Create a deep copy of the list
+    iface_info_t *head = NULL;
+    iface_info_t **tail = &head;
+    
+    for (iface_info_t *src = iface_list; src; src = src->next) {
+        iface_info_t *dest = (iface_info_t *)calloc(1, sizeof(iface_info_t));
+        if (!dest) {
+            // Free any partially copied list
+            while (head) {
+                iface_info_t *next = head->next;
+                free(head);
+                head = next;
+            }
+            iface_list_unlock();
+            return NULL;
+        }
+        
+        // Copy all fields
+        memcpy(dest, src, sizeof(iface_info_t));
+        dest->next = NULL;
+        
+        *tail = dest;
+        tail = &dest->next;
+    }
+    
+    iface_list_unlock();
+    return head;
+}
+
+// Lock management functions
+void iface_list_rdlock(void) {
+    int ret = pthread_rwlock_rdlock(&iface_list_lock);
+    if (ret != 0) {
+        log_err("Failed to acquire read lock: %s", strerror(ret));
+    }
+}
+
+void iface_list_wrlock(void) {
+    int ret = pthread_rwlock_wrlock(&iface_list_lock);
+    if (ret != 0) {
+        log_err("Failed to acquire write lock: %s", strerror(ret));
+    }
+}
+
+void iface_list_unlock(void) {
+    int ret = pthread_rwlock_unlock(&iface_list_lock);
+    if (ret != 0) {
+        log_err("Failed to release lock: %s", strerror(ret));
     }
 }

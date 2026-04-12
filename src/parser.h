@@ -3,6 +3,7 @@
 
 #include <net/if.h>
 #include <linux/if_link.h>  // For struct rtnl_link_stats64
+#include <pthread.h>
 
 #define MAX_ADDR_PER_IF 8
 #define INET6_ADDRSTRLEN 46
@@ -32,7 +33,16 @@ typedef struct iface_info {
     struct iface_info *next;
 } iface_info_t;
 
-// global iface list head
+// Thread-safe interface management
+extern pthread_rwlock_t iface_list_lock;
+
+// Thread-safe access functions
+iface_info_t *get_iface_list_safe(void);
+void iface_list_rdlock(void);
+void iface_list_wrlock(void);
+void iface_list_unlock(void);
+
+// global iface list head (use with lock!)
 extern iface_info_t *iface_list;
 
 void init_iface_table(void);
