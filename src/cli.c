@@ -15,6 +15,41 @@
 
 #define CLI_SOCKET_PATH "/tmp/nlagent.sock"
 static int cli_sock = -1;
+static int cli_epoll_fd = -1;
+
+// Per-connection state
+typedef struct cli_conn {
+    int fd;
+    char buf[256];
+    int buf_len;
+    struct cli_conn *next;
+} cli_conn_t;
+
+static cli_conn_t *cli_connections = NULL;
+
+static void cli_conn_free(cli_conn_t *conn) {
+    if (!conn) return;
+    // Remove from linked list
+    cli_conn_t **pp = &cli_connections;
+    while (*pp) {
+        if (*pp == conn) {
+            *pp = conn->next;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    log_info("CLI session ended for fd %d", conn->fd);
+    epoll_ctl(cli_epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+    close(conn->fd);
+    free(conn);
+}
+
+static cli_conn_t *cli_conn_find(int fd) {
+    for (cli_conn_t *p = cli_connections; p; p = p->next) {
+        if (p->fd == fd) return p;
+    }
+    return NULL;
+}
 
 static int make_socket_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -56,15 +91,10 @@ int cli_start(int epoll_fd) {
         close(cli_sock);
         return -1;
     }
+    cli_epoll_fd = epoll_fd;
     log_info("cli socket listening at %s", CLI_SOCKET_PATH);
     return cli_sock;
 }
-
-// Structure to track active CLI connections
-typedef struct {
-    int fd;
-    int epoll_fd;
-} cli_connection_t;
 
 // Send welcome message and prompt
 static void send_welcome_prompt(int conn) {
@@ -174,48 +204,55 @@ static int handle_command(int conn, const char *command) {
     }
 }
 
-// Handle CLI connection with interactive command loop
-static void handle_cli_session(int conn, int epoll_fd) {
-    (void)epoll_fd; // Unused parameter
-    send_welcome_prompt(conn);
-    
-    char buf[256];
-    int session_active = 1;
-    
-    while (session_active) {
-        // Read command from client
-        int n = read(conn, buf, sizeof(buf)-1);
-        if (n <= 0) {
-            // Connection closed or error
-            break;
-        }
-        
-        buf[n] = '\0';
-        
-        // Remove newline characters
-        char *newline = strchr(buf, '\n');
-        if (newline) *newline = '\0';
-        newline = strchr(buf, '\r');
-        if (newline) *newline = '\0';
-        
-        // Skip empty commands
-        if (strlen(buf) == 0) {
-            send_prompt(conn);
+// Non-blocking data handler for an existing CLI connection
+static void handle_cli_data(cli_conn_t *conn) {
+    char tmp[256];
+    int n = read(conn->fd, tmp, sizeof(tmp) - 1);
+    if (n <= 0) {
+        cli_conn_free(conn);
+        return;
+    }
+
+    // Append to line buffer
+    int space = (int)sizeof(conn->buf) - conn->buf_len - 1;
+    if (space > n) space = n;
+    memcpy(conn->buf + conn->buf_len, tmp, space);
+    conn->buf_len += space;
+    conn->buf[conn->buf_len] = '\0';
+
+    // Process complete lines from buffer
+    char *cursor = conn->buf;
+    char *newline;
+    while ((newline = strchr(cursor, '\n')) != NULL) {
+        *newline = '\0';
+
+        // Trim trailing \r
+        char *cr = newline > cursor ? newline - 1 : NULL;
+        if (cr && *cr == '\r') *cr = '\0';
+
+        // Skip empty lines
+        if (*cursor == '\0') {
+            send_prompt(conn->fd);
+            cursor = newline + 1;
             continue;
         }
-        
-        // Handle command
-        int should_exit = handle_command(conn, buf);
-        
+
+        int should_exit = handle_command(conn->fd, cursor);
         if (should_exit) {
-            session_active = 0;
-        } else {
-            send_prompt(conn);
+            cli_conn_free(conn);
+            return;
         }
+        send_prompt(conn->fd);
+
+        cursor = newline + 1;
     }
-    
-    close(conn);
-    log_info("CLI session ended for fd %d", conn);
+
+    // Keep remaining partial line
+    int remaining = conn->buf + conn->buf_len - cursor;
+    if (remaining > 0 && cursor != conn->buf) {
+        memmove(conn->buf, cursor, remaining);
+    }
+    conn->buf_len = remaining;
 }
 
 void cli_handle_connection(int fd) {
@@ -226,10 +263,39 @@ void cli_handle_connection(int fd) {
             log_err("accept cli conn failed: %s", strerror(errno));
             return;
         }
-        
+
         log_info("New CLI connection accepted on fd %d", conn);
-        
-        // Handle the CLI session (this will block until session ends)
-        handle_cli_session(conn, -1); // -1 indicates no epoll registration needed
+
+        // Make non-blocking and register with epoll
+        make_socket_non_blocking(conn);
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = conn;
+        if (epoll_ctl(cli_epoll_fd, EPOLL_CTL_ADD, conn, &ev) < 0) {
+            log_err("epoll_ctl add cli conn failed: %s", strerror(errno));
+            close(conn);
+            return;
+        }
+
+        // Allocate and track connection state
+        cli_conn_t *state = calloc(1, sizeof(cli_conn_t));
+        if (!state) {
+            log_err("Failed to allocate CLI connection state");
+            epoll_ctl(cli_epoll_fd, EPOLL_CTL_DEL, conn, NULL);
+            close(conn);
+            return;
+        }
+        state->fd = conn;
+        state->buf_len = 0;
+        state->next = cli_connections;
+        cli_connections = state;
+
+        send_welcome_prompt(conn);
+    } else {
+        // Data on an existing CLI connection
+        cli_conn_t *state = cli_conn_find(fd);
+        if (state) {
+            handle_cli_data(state);
+        }
     }
 }

@@ -32,6 +32,12 @@ static struct rtattr *rtattr_get(struct rtattr *tb[], int max, struct rtattr *rt
     return NULL;
 }
 
+static const void *addr_to_str(int family, void *addr, char *buf, size_t len) {
+    if (family == AF_INET)  inet_ntop(AF_INET, addr, buf, len);
+    if (family == AF_INET6) inet_ntop(AF_INET6, addr, buf, len);
+    return NULL;
+}
+
 static int send_nl_addr_dump_req(int sock)
 {
     struct {
@@ -88,20 +94,13 @@ static void handle_link_msg(struct nlmsghdr *nlh) {
     rtattr_get(tb, IFLA_MAX, rta, len);
 
     if (tb[IFLA_IFNAME]) {
-        const char *ifname = (const char *)RTA_DATA(tb[IFLA_IFNAME]);
-        /* update parser table by name if we have it */
-        iface_info_t *inf = get_iface_by_name(ifname);
-        if (inf) {
-            update_iface_status(ifindex, is_up);
-        } else {
-            /* maybe new iface, try to register (parser init uses getifaddrs only once) */
+        const char *ifname = RTA_DATA(tb[IFLA_IFNAME]);
+        if (!get_iface_by_name(ifname)) {
             log_info("link event for unknown ifname=%s ifindex=%d up=%d", ifname, ifindex, is_up);
-            /* best-effort: call update by index (parser will ignore if not found) */
-            update_iface_status(ifindex, is_up);
         }
-    } else {
-        update_iface_status(ifindex, is_up);
     }
+
+    update_iface_status(ifindex, is_up);
 }
 
 /* handle address (RTM_NEWADDR / RTM_DELADDR) */
@@ -110,6 +109,8 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
     int ifindex = ifa->ifa_index;
     int family = ifa->ifa_family; /* AF_INET or AF_INET6 */
     int prefixlen = ifa->ifa_prefixlen;
+    
+    if (ifa->ifa_prefixlen == 0)  return;
 
     struct rtattr *tb[IFA_MAX + 1];
     memset(tb, 0, sizeof(tb));
@@ -118,25 +119,14 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
     rtattr_get(tb, IFA_MAX, rta, len);
 
     char addr_str[INET6_ADDRSTRLEN] = {0};
-    if (ifa->ifa_prefixlen == 0) {
-        return;
-    }
-
+    
+    void *addr = NULL;
     if (tb[IFA_LOCAL]) {
-        void *addr = RTA_DATA(tb[IFA_LOCAL]);
-        if (family == AF_INET) {
-            inet_ntop(AF_INET, addr, addr_str, sizeof(addr_str));
-        } else if (family == AF_INET6) {
-            inet_ntop(AF_INET6, addr, addr_str, sizeof(addr_str));
-        }
+        addr = RTA_DATA(tb[IFA_LOCAL]);
     } else if (tb[IFA_ADDRESS]) {
-        void *addr = RTA_DATA(tb[IFA_ADDRESS]);
-        if (family == AF_INET) {
-            inet_ntop(AF_INET, addr, addr_str, sizeof(addr_str));
-        } else if (family == AF_INET6) {
-            inet_ntop(AF_INET6, addr, addr_str, sizeof(addr_str));
-        }
+        addr = RTA_DATA(tb[IFA_ADDRESS]);
     }
+    addr_to_str(family, addr, addr_str, sizeof(addr_str));
 
     if (nlh->nlmsg_type == RTM_NEWADDR) {
         log_info("NEWADDR on ifindex=%d family=%d addr=%s", ifindex, family, addr_str[0]?addr_str:"<none>");
@@ -145,7 +135,7 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
             if (!inf) {
                 inf = ensure_iface_by_index(ifindex, NULL);
             }
-            if (inf && addr_str[0]) {
+            if (inf) {
                 iface_add_addr(inf, family, addr_str, prefixlen);
             }
         }
