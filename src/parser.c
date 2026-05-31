@@ -55,10 +55,44 @@ static iface_info_t *find_iface_by_index(int ifindex) {
 }
 
 static iface_info_t *find_iface_by_name(const char *ifname) {
+    if (!ifname) return NULL;
     for (iface_info_t *p = iface_list; p; p = p->next) {
         if (strcmp(p->ifname, ifname) == 0) return p;
     }
     return NULL;
+}
+
+static void set_iface_name(iface_info_t *iface, const char *ifname) {
+    if (!iface || !ifname || ifname[0] == '\0') return;
+    snprintf(iface->ifname, IFNAMSIZ, "%s", ifname);
+}
+
+static iface_info_t *ensure_iface_by_index_locked(int ifindex, const char *ifname) {
+    iface_info_t *inf = find_iface_by_index(ifindex);
+    if (inf) {
+        set_iface_name(inf, ifname);
+        return inf;
+    }
+
+    iface_info_t *new_iface = create_iface_node();
+    if (!new_iface) {
+        log_err("Failed to create iface node for index %d", ifindex);
+        return NULL;
+    }
+
+    new_iface->ifindex = ifindex;
+    if (ifname && ifname[0] != '\0') {
+        set_iface_name(new_iface, ifname);
+    } else {
+        snprintf(new_iface->ifname, IFNAMSIZ, "if%d", ifindex);
+    }
+    new_iface->up = 0;
+    new_iface->next = iface_list;
+    iface_list = new_iface;
+    iface_count++;
+
+    log_info("register iface: %s idx=%d", new_iface->ifname, new_iface->ifindex);
+    return new_iface;
 }
 
 // main functions
@@ -137,40 +171,10 @@ void init_iface_table(void) {
 }
 
 iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname) {
-    iface_info_t *inf = get_iface_by_index(ifindex);
-    if (inf) return inf;
-    
-    // create new iface node
-    iface_info_t *new_iface = create_iface_node();
-    if (!new_iface) {
-        log_err("Failed to create iface node for index %d", ifindex);
-        return NULL;
-    }
-    
-    new_iface->ifindex = ifindex;
-    if (ifname && ifname[0] != '\0') {
-        strncpy(new_iface->ifname, ifname, IFNAMSIZ - 1);
-        new_iface->ifname[IFNAMSIZ - 1] = '\0';
-    } else {
-        snprintf(new_iface->ifname, IFNAMSIZ, "if%d", ifindex);
-    }
-    
-    new_iface->up = 0;  // default state
-    new_iface->rx_bytes = 0;
-    new_iface->tx_bytes = 0;
-    new_iface->rx_err = 0;
-    new_iface->tx_err = 0;
-    new_iface->addr_cnt = 0;
-    
-    // add to the head of the list
     iface_list_wrlock();
-    new_iface->next = iface_list;
-    iface_list = new_iface;
-    iface_count++;
+    iface_info_t *inf = ensure_iface_by_index_locked(ifindex, ifname);
     iface_list_unlock();
-    
-    log_info("register iface: %s idx=%d", new_iface->ifname, new_iface->ifindex);
-    return new_iface;
+    return inf;
 }
 
 iface_info_t *get_iface_by_index(int ifindex) {
@@ -182,10 +186,19 @@ iface_info_t *get_iface_by_name(const char *ifname) {
 }
 
 void update_iface_status(int ifindex, int up) {
-    iface_info_t *inf = get_iface_by_index(ifindex);
-    if (!inf) return;
+    upsert_iface_link(ifindex, NULL, up);
+}
+
+void upsert_iface_link(int ifindex, const char *ifname, int up) {
+    iface_list_wrlock();
+    iface_info_t *inf = ensure_iface_by_index_locked(ifindex, ifname);
+    if (!inf) {
+        iface_list_unlock();
+        return;
+    }
     inf->up = up;
     log_info("iface %s (idx %d) status -> %s", inf->ifname, ifindex, up ? "UP" : "DOWN");
+    iface_list_unlock();
 }
 
 void update_iface_counters(int ifindex, unsigned long rx_bytes, unsigned long tx_bytes, 
@@ -286,6 +299,24 @@ void iface_del_addr(iface_info_t *inf, int family, const char *addr, int prefixl
     }
     
     log_info("iface %s addr %s not found for deletion", inf->ifname, addr);
+}
+
+void iface_add_addr_by_index(int ifindex, const char *ifname, int family, const char *addr, int prefixlen) {
+    iface_list_wrlock();
+    iface_info_t *inf = ensure_iface_by_index_locked(ifindex, ifname);
+    if (inf) {
+        iface_add_addr(inf, family, addr, prefixlen);
+    }
+    iface_list_unlock();
+}
+
+void iface_del_addr_by_index(int ifindex, int family, const char *addr, int prefixlen) {
+    iface_list_wrlock();
+    iface_info_t *inf = find_iface_by_index(ifindex);
+    if (inf) {
+        iface_del_addr(inf, family, addr, prefixlen);
+    }
+    iface_list_unlock();
 }
 
 void list_interfaces(void) {
@@ -571,6 +602,21 @@ void update_all_iface_stats_via_netlink(void) {
 // Thread-safe access functions implementation
 
 // Get a safe copy of the iface list (caller must free after use)
+int get_iface_snapshot_by_name(const char *ifname, iface_info_t *out) {
+    if (!ifname || !out) return -1;
+
+    int found = -1;
+    iface_list_rdlock();
+    iface_info_t *src = find_iface_by_name(ifname);
+    if (src) {
+        memcpy(out, src, sizeof(iface_info_t));
+        out->next = NULL;
+        found = 0;
+    }
+    iface_list_unlock();
+    return found;
+}
+
 iface_info_t *get_iface_list_safe(void) {
     iface_list_rdlock();
     

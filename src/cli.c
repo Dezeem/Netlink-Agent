@@ -147,94 +147,103 @@ static void send_prompt(int conn) {
     cli_write(conn, prompt, strlen(prompt));
 }
 
+static void free_iface_list_copy(iface_info_t *list) {
+    while (list) {
+        iface_info_t *next = list->next;
+        free(list);
+        list = next;
+    }
+}
+
+static void send_iface_info(int conn, const iface_info_t *inf) {
+    char line[512];
+    int len = snprintf(line, sizeof(line),
+        "Interface: %s\n"
+        "  Index: %d, Status: %s\n"
+        "  Counters: RX=%llu TX=%llu RX_ERR=%llu TX_ERR=%llu\n",
+        inf->ifname,
+        inf->ifindex,
+        inf->up ? "UP" : "DOWN",
+        (unsigned long long)inf->stats.rx_bytes,
+        (unsigned long long)inf->stats.tx_bytes,
+        (unsigned long long)inf->stats.rx_errors,
+        (unsigned long long)inf->stats.tx_errors);
+    cli_write(conn, line, (size_t)len);
+
+    if (inf->addr_cnt > 0) {
+        len = snprintf(line, sizeof(line), "  Addresses (%d):\n", inf->addr_cnt);
+        cli_write(conn, line, (size_t)len);
+
+        for (int i = 0; i < inf->addr_cnt; i++) {
+            len = snprintf(line, sizeof(line),
+                "    [%d] %s/%d (%s)\n",
+                i + 1,
+                inf->addrs[i].addr,
+                inf->addrs[i].prefixlen,
+                inf->addrs[i].family == AF_INET ? "IPv4" : "IPv6");
+            cli_write(conn, line, (size_t)len);
+        }
+    } else {
+        cli_write(conn, "  No addresses\n", 15);
+    }
+    cli_write(conn, "\n", 1);
+}
+
 // Handle individual command
 static int handle_command(int conn, const char *command) {
     if (strncmp(command, "show interfaces", 15) == 0 || strncmp(command, "list", 4) == 0) {
-        iface_info_t *inf = iface_list;
-        char line[512];
+        iface_info_t *safe_list = get_iface_list_safe();
         int total_interfaces = 0;
-
-        // Count interfaces first
-        while (inf) {
+        for (iface_info_t *inf = safe_list; inf; inf = inf->next) {
             total_interfaces++;
-            inf = inf->next;
         }
 
-        // Send header
+        char line[128];
         int len = snprintf(line, sizeof(line), "=== Network Interfaces (%d) ===\n", total_interfaces);
         cli_write(conn, line, (size_t)len);
 
-        // Send interface details using thread-safe copy
-        iface_info_t *safe_list = get_iface_list_safe();
-        if (!safe_list) {
-            cli_write(conn, "Error: Failed to get interface list\n", 35);
+        for (iface_info_t *inf = safe_list; inf; inf = inf->next) {
+            send_iface_info(conn, inf);
+        }
+        free_iface_list_copy(safe_list);
+        return 0;
+    }
+    else if (strncmp(command, "show interface ", 15) == 0) {
+        const char *ifname = command + 15;
+        while (*ifname == ' ') ifname++;
+        if (*ifname == '\0') {
+            cli_write(conn, "Usage: show interface <ifname>\n", 30);
             return 0;
         }
-        
-        inf = safe_list;
-        while (inf) {
-            len = snprintf(line, sizeof(line),
-                "Interface: %s\n"
-                "  Index: %d, Status: %s\n"
-                "  Counters: RX=%llu TX=%llu RX_ERR=%llu TX_ERR=%llu\n",
-                inf->ifname,
-                inf->ifindex,
-                inf->up ? "UP" : "DOWN",
-                (unsigned long long)inf->stats.rx_bytes,
-                (unsigned long long)inf->stats.tx_bytes,
-                (unsigned long long)inf->stats.rx_errors,
-                (unsigned long long)inf->stats.tx_errors);
-            cli_write(conn, line, (size_t)len);
 
-            // Send IP addresses
-            if (inf->addr_cnt > 0) {
-                len = snprintf(line, sizeof(line), "  Addresses (%d):\n", inf->addr_cnt);
-                cli_write(conn, line, (size_t)len);
-                
-                for (int i = 0; i < inf->addr_cnt; i++) {
-                    len = snprintf(line, sizeof(line),
-                        "    [%d] %s/%d (%s)\n",
-                        i + 1,
-                        inf->addrs[i].addr,
-                        inf->addrs[i].prefixlen,
-                        inf->addrs[i].family == AF_INET ? "IPv4" : "IPv6");
-                    cli_write(conn, line, (size_t)len);
-                }
-            } else {
-                cli_write(conn, "  No addresses\n", 15);
-            }
-            
-            cli_write(conn, "\n", 1);
-            inf = inf->next;
+        iface_info_t snapshot;
+        if (get_iface_snapshot_by_name(ifname, &snapshot) < 0) {
+            char line[128];
+            int len = snprintf(line, sizeof(line), "Interface not found: %s\n", ifname);
+            cli_write(conn, line, (size_t)len);
+            return 0;
         }
-        
-        // Free the safe list copy
-        inf = safe_list;
-        while (inf) {
-            iface_info_t *next = inf->next;
-            free(inf);
-            inf = next;
-        }
-        
-        return 0; // Continue session
+        send_iface_info(conn, &snapshot);
+        return 0;
     }
     else if (strncmp(command, "help", 4) == 0) {
         const char *help = "Available commands:\n"
-                         "  show interfaces, list - Display interface status\n"
+                         "  show interfaces, list - Display all interface status\n"
+                         "  show interface <ifname> - Display one interface\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n";
         cli_write(conn, help, strlen(help));
-        return 0; // Continue session
+        return 0;
     }
     else if (strncmp(command, "quit", 4) == 0 || strncmp(command, "exit", 4) == 0) {
         const char *goodbye = "Goodbye!\n";
         cli_write(conn, goodbye, strlen(goodbye));
-        return 1; // End session
+        return 1;
     }
     else {
         const char *resp = "Unknown command. Type 'help' for available commands.\n";
         cli_write(conn, resp, strlen(resp));
-        return 0; // Continue session
+        return 0;
     }
 }
 

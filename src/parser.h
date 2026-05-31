@@ -38,6 +38,7 @@ extern pthread_rwlock_t iface_list_lock;
 
 // Thread-safe access functions
 iface_info_t *get_iface_list_safe(void);
+int get_iface_snapshot_by_name(const char *ifname, iface_info_t *out);
 void iface_list_rdlock(void);
 void iface_list_wrlock(void);
 void iface_list_unlock(void);
@@ -49,14 +50,18 @@ void init_iface_table(void);
 iface_info_t *get_iface_by_index(int ifindex);
 iface_info_t *get_iface_by_name(const char *ifname);
 void update_iface_status(int ifindex, int up);
+void upsert_iface_link(int ifindex, const char *ifname, int up);
 void update_iface_counters(int ifindex, unsigned long rx_bytes, unsigned long tx_bytes, unsigned long rx_err, unsigned long tx_err);
 void update_iface_ip(int ifindex, const char *ip); /* ip==NULL clears the stored ip */
 void list_interfaces(void);
 iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname);
+void delete_iface_by_index(int ifindex);
 
 // addr management functions
 void iface_add_addr(iface_info_t *inf, int family, const char *addr, int prefixlen);
 void iface_del_addr(iface_info_t *inf, int family, const char *addr, int prefixlen);
+void iface_add_addr_by_index(int ifindex, const char *ifname, int family, const char *addr, int prefixlen);
+void iface_del_addr_by_index(int ifindex, int family, const char *addr, int prefixlen);
 
 // SSOT iterator functions
 void foreach_iface(void (*callback)(iface_info_t *iface, void *data), void *data);

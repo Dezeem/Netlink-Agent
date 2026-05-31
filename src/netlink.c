@@ -106,14 +106,15 @@ static void handle_link_msg(struct nlmsghdr *nlh) {
     int len = IFLA_PAYLOAD(nlh);
     rtattr_get(tb, IFLA_MAX, rta, len);
 
-    if (tb[IFLA_IFNAME]) {
-        const char *ifname = RTA_DATA(tb[IFLA_IFNAME]);
-        if (!get_iface_by_name(ifname)) {
-            log_info("link event for unknown ifname=%s ifindex=%d up=%d", ifname, ifindex, is_up);
-        }
+    const char *ifname = tb[IFLA_IFNAME] ? (const char *)RTA_DATA(tb[IFLA_IFNAME]) : NULL;
+
+    if (nlh->nlmsg_type == RTM_DELLINK) {
+        log_info("DELLINK ifname=%s ifindex=%d", ifname ? ifname : "<unknown>", ifindex);
+        delete_iface_by_index(ifindex);
+        return;
     }
 
-    update_iface_status(ifindex, is_up);
+    upsert_iface_link(ifindex, ifname, is_up);
 }
 
 /* handle address (RTM_NEWADDR / RTM_DELADDR) */
@@ -146,24 +147,12 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
     if (nlh->nlmsg_type == RTM_NEWADDR) {
         log_info("NEWADDR on ifindex=%d family=%d addr=%s", ifindex, family, addr_str[0]?addr_str:"<none>");
         if (addr_str[0]) {
-            iface_info_t *inf = get_iface_by_index(ifindex);
-            if (!inf) {
-                inf = ensure_iface_by_index(ifindex, NULL);
-            }
-            if (inf) {
-                iface_add_addr(inf, family, addr_str, prefixlen);
-            }
+            iface_add_addr_by_index(ifindex, NULL, family, addr_str, prefixlen);
         }
     } else if (nlh->nlmsg_type == RTM_DELADDR) {
         log_info("DELADDR on ifindex=%d family=%d addr=%s", ifindex, family, addr_str[0]?addr_str:"<none>");
-        /* On address delete we might clear IP if matches; simple approach: clear if equal */
-        /* parser provides helper to clear if ip matches */
-        iface_info_t *inf = get_iface_by_index(ifindex);
-        if (!inf) {
-            inf = ensure_iface_by_index(ifindex, NULL);
-        }
-        if (inf && addr_str[0]) {
-            iface_del_addr(inf, family, addr_str, prefixlen);
+        if (addr_str[0]) {
+            iface_del_addr_by_index(ifindex, family, addr_str, prefixlen);
         }
     }
 }
