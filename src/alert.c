@@ -4,6 +4,7 @@
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define MAX_INTERFACES 128
 
@@ -37,8 +38,7 @@ static void alert_check_callback(iface_info_t *iface, void *data) {
     if (idx == -1) {
         if (iface_count < MAX_INTERFACES) {
             idx = iface_count;
-            strncpy(iface_trackers[idx].ifname, iface->ifname, IFNAMSIZ - 1);
-            iface_trackers[idx].ifname[IFNAMSIZ - 1] = '\0';
+            snprintf(iface_trackers[idx].ifname, IFNAMSIZ, "%s", iface->ifname);
             iface_count++;
         } else {
             log_warn("Too many interfaces for alert tracking");

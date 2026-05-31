@@ -21,6 +21,19 @@
 static int nl_sock = -1;
 int netlink_fd(void) { return nl_sock; }
 
+static int make_socket_non_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        log_err("fcntl F_GETFL failed for fd %d: %s", fd, strerror(errno));
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        log_err("fcntl F_SETFL O_NONBLOCK failed for fd %d: %s", fd, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 /* helper: parse rtattr list */
 static struct rtattr *rtattr_get(struct rtattr *tb[], int max, struct rtattr *rta, int len) {
     while (RTA_OK(rta, len)) {
@@ -126,7 +139,9 @@ static void handle_addr_msg(struct nlmsghdr *nlh) {
     } else if (tb[IFA_ADDRESS]) {
         addr = RTA_DATA(tb[IFA_ADDRESS]);
     }
-    addr_to_str(family, addr, addr_str, sizeof(addr_str));
+    if (addr) {
+        addr_to_str(family, addr, addr_str, sizeof(addr_str));
+    }
 
     if (nlh->nlmsg_type == RTM_NEWADDR) {
         log_info("NEWADDR on ifindex=%d family=%d addr=%s", ifindex, family, addr_str[0]?addr_str:"<none>");
@@ -201,20 +216,24 @@ int netlink_start(int epoll_fd) {
     if (bind(nl_sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
         log_err("bind netlink failed: %s", strerror(errno));
         close(nl_sock);
+        nl_sock = -1;
         return -1;
     }
 
-    /* set socket non-blocking (optional but good) */
-    int flags = fcntl(nl_sock, F_GETFL, 0);
-    if (flags >= 0) fcntl(nl_sock, F_SETFL, flags | O_NONBLOCK);
+    if (make_socket_non_blocking(nl_sock) < 0) {
+        close(nl_sock);
+        nl_sock = -1;
+        return -1;
+    }
 
-    /* add to epoll */
+    /* add to epoll; EPOLLET requires process_netlink_messages() to drain the socket */
     struct epoll_event ev;
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = nl_sock;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, nl_sock, &ev) < 0) {
         log_err("epoll_ctl add nl_sock failed: %s", strerror(errno));
         close(nl_sock);
+        nl_sock = -1;
         return -1;
     }
     log_info("netlink socket started (fd=%d)", nl_sock);
@@ -225,19 +244,55 @@ int netlink_start(int epoll_fd) {
 
 /* main message processing */
 void process_netlink_messages(void) {
-    char buf[8192];
-    struct iovec iov = { buf, sizeof(buf) };
-    struct sockaddr_nl sa;
-    struct msghdr msg = { (void*)&sa, sizeof(sa), &iov, 1, NULL, 0, 0 };
+    if (nl_sock < 0) return;
 
-    ssize_t len;
-    while ((len = recvmsg(nl_sock, &msg, 0)) > 0) {
-        for (struct nlmsghdr *nlh = (struct nlmsghdr*)buf; NLMSG_OK(nlh, (unsigned int)len); nlh = NLMSG_NEXT(nlh, len)) {
+    for (;;) {
+        char buf[8192];
+        struct sockaddr_nl sa;
+        struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+        struct msghdr msg = {
+            .msg_name = &sa,
+            .msg_namelen = sizeof(sa),
+            .msg_iov = &iov,
+            .msg_iovlen = 1,
+        };
+
+        ssize_t len = recvmsg(nl_sock, &msg, 0);
+        if (len < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            if (errno == ENOBUFS) {
+                log_warn("netlink receive buffer overrun: %s", strerror(errno));
+                continue;
+            }
+            log_err("recvmsg nl_sock failed: %s", strerror(errno));
+            break;
+        }
+        if (len == 0) {
+            log_warn("netlink socket returned EOF");
+            break;
+        }
+        if (msg.msg_flags & MSG_TRUNC) {
+            log_warn("netlink message truncated; consider increasing receive buffer");
+            continue;
+        }
+
+        ssize_t remaining = len;
+        for (struct nlmsghdr *nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, remaining); nlh = NLMSG_NEXT(nlh, remaining)) {
             if (nlh->nlmsg_type == NLMSG_ERROR) {
+                struct nlmsgerr *err = NLMSG_DATA(nlh);
+                if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(*err)) && err->error != 0) {
+                    log_warn("netlink reported error: %s", strerror(-err->error));
+                }
                 continue;
             }
             if (nlh->nlmsg_type == NLMSG_DONE) {
                 log_info("netlink dump completed");
+                continue;
             }
             switch (nlh->nlmsg_type) {
                 case RTM_NEWLINK:
@@ -257,8 +312,8 @@ void process_netlink_messages(void) {
                     break;
             }
         }
-    }
-    if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        log_err("recvmsg nl_sock failed: %s", strerror(errno));
+        if (remaining > 0) {
+            log_warn("netlink message parse stopped with %zd trailing bytes", remaining);
+        }
     }
 }

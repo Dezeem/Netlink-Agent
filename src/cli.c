@@ -53,9 +53,38 @@ static cli_conn_t *cli_conn_find(int fd) {
 
 static int make_socket_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return -1;
-    flags |= O_NONBLOCK;
-    if (fcntl(fd, F_SETFL, flags) == -1) return -1;
+    if (flags < 0) {
+        log_err("fcntl F_GETFL failed for fd %d: %s", fd, strerror(errno));
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        log_err("fcntl F_SETFL O_NONBLOCK failed for fd %d: %s", fd, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int cli_write(int fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            log_warn("cli fd %d send buffer full; response truncated", fd);
+            return -1;
+        }
+        if (n < 0) {
+            log_warn("write cli fd %d failed: %s", fd, strerror(errno));
+            return -1;
+        }
+        return -1;
+    }
     return 0;
 }
 
@@ -73,22 +102,27 @@ int cli_start(int epoll_fd) {
     if (bind(cli_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         log_err("cli bind failed: %s", strerror(errno));
         close(cli_sock);
+        cli_sock = -1;
         return -1;
     }
-    if (listen(cli_sock, 5) < 0) {
+    if (listen(cli_sock, SOMAXCONN) < 0) {
         log_err("cli listen failed: %s", strerror(errno));
         close(cli_sock);
+        cli_sock = -1;
         return -1;
     }
     if (make_socket_non_blocking(cli_sock) < 0) {
-        log_warn("could not make cli_sock non blocking");
+        close(cli_sock);
+        cli_sock = -1;
+        return -1;
     }
     struct epoll_event ev;
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = cli_sock;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
         log_err("epoll_ctl add cli_sock failed: %s", strerror(errno));
         close(cli_sock);
+        cli_sock = -1;
         return -1;
     }
     cli_epoll_fd = epoll_fd;
@@ -104,13 +138,13 @@ static void send_welcome_prompt(int conn) {
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n"
                          "\n> ";
-    write(conn, welcome, strlen(welcome));
+    cli_write(conn, welcome, strlen(welcome));
 }
 
 // Send command prompt
 static void send_prompt(int conn) {
     const char *prompt = "> ";
-    write(conn, prompt, strlen(prompt));
+    cli_write(conn, prompt, strlen(prompt));
 }
 
 // Handle individual command
@@ -128,12 +162,12 @@ static int handle_command(int conn, const char *command) {
 
         // Send header
         int len = snprintf(line, sizeof(line), "=== Network Interfaces (%d) ===\n", total_interfaces);
-        write(conn, line, len);
+        cli_write(conn, line, (size_t)len);
 
         // Send interface details using thread-safe copy
         iface_info_t *safe_list = get_iface_list_safe();
         if (!safe_list) {
-            write(conn, "Error: Failed to get interface list\n", 35);
+            cli_write(conn, "Error: Failed to get interface list\n", 35);
             return 0;
         }
         
@@ -150,12 +184,12 @@ static int handle_command(int conn, const char *command) {
                 (unsigned long long)inf->stats.tx_bytes,
                 (unsigned long long)inf->stats.rx_errors,
                 (unsigned long long)inf->stats.tx_errors);
-            write(conn, line, len);
+            cli_write(conn, line, (size_t)len);
 
             // Send IP addresses
             if (inf->addr_cnt > 0) {
                 len = snprintf(line, sizeof(line), "  Addresses (%d):\n", inf->addr_cnt);
-                write(conn, line, len);
+                cli_write(conn, line, (size_t)len);
                 
                 for (int i = 0; i < inf->addr_cnt; i++) {
                     len = snprintf(line, sizeof(line),
@@ -164,13 +198,13 @@ static int handle_command(int conn, const char *command) {
                         inf->addrs[i].addr,
                         inf->addrs[i].prefixlen,
                         inf->addrs[i].family == AF_INET ? "IPv4" : "IPv6");
-                    write(conn, line, len);
+                    cli_write(conn, line, (size_t)len);
                 }
             } else {
-                write(conn, "  No addresses\n", 15);
+                cli_write(conn, "  No addresses\n", 15);
             }
             
-            write(conn, "\n", 1);
+            cli_write(conn, "\n", 1);
             inf = inf->next;
         }
         
@@ -189,48 +223,31 @@ static int handle_command(int conn, const char *command) {
                          "  show interfaces, list - Display interface status\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n";
-        write(conn, help, strlen(help));
+        cli_write(conn, help, strlen(help));
         return 0; // Continue session
     }
     else if (strncmp(command, "quit", 4) == 0 || strncmp(command, "exit", 4) == 0) {
         const char *goodbye = "Goodbye!\n";
-        write(conn, goodbye, strlen(goodbye));
+        cli_write(conn, goodbye, strlen(goodbye));
         return 1; // End session
     }
     else {
         const char *resp = "Unknown command. Type 'help' for available commands.\n";
-        write(conn, resp, strlen(resp));
+        cli_write(conn, resp, strlen(resp));
         return 0; // Continue session
     }
 }
 
-// Non-blocking data handler for an existing CLI connection
-static void handle_cli_data(cli_conn_t *conn) {
-    char tmp[256];
-    int n = read(conn->fd, tmp, sizeof(tmp) - 1);
-    if (n <= 0) {
-        cli_conn_free(conn);
-        return;
-    }
-
-    // Append to line buffer
-    int space = (int)sizeof(conn->buf) - conn->buf_len - 1;
-    if (space > n) space = n;
-    memcpy(conn->buf + conn->buf_len, tmp, space);
-    conn->buf_len += space;
-    conn->buf[conn->buf_len] = '\0';
-
-    // Process complete lines from buffer
+static int process_cli_buffer(cli_conn_t *conn) {
     char *cursor = conn->buf;
     char *newline;
+
     while ((newline = strchr(cursor, '\n')) != NULL) {
         *newline = '\0';
 
-        // Trim trailing \r
         char *cr = newline > cursor ? newline - 1 : NULL;
         if (cr && *cr == '\r') *cr = '\0';
 
-        // Skip empty lines
         if (*cursor == '\0') {
             send_prompt(conn->fd);
             cursor = newline + 1;
@@ -240,62 +257,120 @@ static void handle_cli_data(cli_conn_t *conn) {
         int should_exit = handle_command(conn->fd, cursor);
         if (should_exit) {
             cli_conn_free(conn);
-            return;
+            return 1;
         }
         send_prompt(conn->fd);
 
         cursor = newline + 1;
     }
 
-    // Keep remaining partial line
-    int remaining = conn->buf + conn->buf_len - cursor;
+    int remaining = (int)(conn->buf + conn->buf_len - cursor);
     if (remaining > 0 && cursor != conn->buf) {
         memmove(conn->buf, cursor, remaining);
     }
     conn->buf_len = remaining;
+    conn->buf[conn->buf_len] = '\0';
+    return 0;
+}
+
+// Non-blocking data handler for an existing CLI connection; drains until EAGAIN for EPOLLET
+static void handle_cli_data(cli_conn_t *conn) {
+    for (;;) {
+        char tmp[256];
+        ssize_t n = read(conn->fd, tmp, sizeof(tmp));
+        if (n > 0) {
+            int space = (int)sizeof(conn->buf) - conn->buf_len - 1;
+            if (space <= 0) {
+                cli_write(conn->fd, "Command line too long\n", 22);
+                cli_conn_free(conn);
+                return;
+            }
+
+            int copy_len = n < space ? (int)n : space;
+            memcpy(conn->buf + conn->buf_len, tmp, copy_len);
+            conn->buf_len += copy_len;
+            conn->buf[conn->buf_len] = '\0';
+
+            if (process_cli_buffer(conn)) {
+                return;
+            }
+            if (copy_len < n) {
+                cli_write(conn->fd, "Command line too long\n", 22);
+                cli_conn_free(conn);
+                return;
+            }
+            continue;
+        }
+
+        if (n == 0) {
+            cli_conn_free(conn);
+            return;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+
+        log_warn("read cli fd %d failed: %s", conn->fd, strerror(errno));
+        cli_conn_free(conn);
+        return;
+    }
 }
 
 void cli_handle_connection(int fd) {
     if (fd == cli_sock) {
-        // New connection request
-        int conn = accept(cli_sock, NULL, NULL);
-        if (conn < 0) {
-            log_err("accept cli conn failed: %s", strerror(errno));
-            return;
+        for (;;) {
+            int conn = accept(cli_sock, NULL, NULL);
+            if (conn < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return;
+                }
+                log_err("accept cli conn failed: %s", strerror(errno));
+                return;
+            }
+
+            log_info("New CLI connection accepted on fd %d", conn);
+
+            if (make_socket_non_blocking(conn) < 0) {
+                close(conn);
+                continue;
+            }
+
+            cli_conn_t *state = calloc(1, sizeof(cli_conn_t));
+            if (!state) {
+                log_err("Failed to allocate CLI connection state");
+                close(conn);
+                continue;
+            }
+            state->fd = conn;
+            state->buf_len = 0;
+            state->next = cli_connections;
+            cli_connections = state;
+
+            struct epoll_event ev;
+            ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+            ev.data.fd = conn;
+            if (epoll_ctl(cli_epoll_fd, EPOLL_CTL_ADD, conn, &ev) < 0) {
+                log_err("epoll_ctl add cli conn failed: %s", strerror(errno));
+                cli_conn_free(state);
+                continue;
+            }
+
+            send_welcome_prompt(conn);
         }
+    }
 
-        log_info("New CLI connection accepted on fd %d", conn);
-
-        // Make non-blocking and register with epoll
-        make_socket_non_blocking(conn);
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.fd = conn;
-        if (epoll_ctl(cli_epoll_fd, EPOLL_CTL_ADD, conn, &ev) < 0) {
-            log_err("epoll_ctl add cli conn failed: %s", strerror(errno));
-            close(conn);
-            return;
-        }
-
-        // Allocate and track connection state
-        cli_conn_t *state = calloc(1, sizeof(cli_conn_t));
-        if (!state) {
-            log_err("Failed to allocate CLI connection state");
-            epoll_ctl(cli_epoll_fd, EPOLL_CTL_DEL, conn, NULL);
-            close(conn);
-            return;
-        }
-        state->fd = conn;
-        state->buf_len = 0;
-        state->next = cli_connections;
-        cli_connections = state;
-
-        send_welcome_prompt(conn);
+    cli_conn_t *state = cli_conn_find(fd);
+    if (state) {
+        handle_cli_data(state);
     } else {
-        // Data on an existing CLI connection
-        cli_conn_t *state = cli_conn_find(fd);
-        if (state) {
-            handle_cli_data(state);
-        }
+        log_warn("event for unknown CLI fd %d", fd);
+        epoll_ctl(cli_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
     }
 }

@@ -50,6 +50,9 @@ static int perform_initialization(void) {
 }
 
 int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
