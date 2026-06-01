@@ -2,6 +2,7 @@
 #include "cli.h"
 #include "logger.h"
 #include "parser.h"
+#include "runtime_metrics.h"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -39,6 +40,7 @@ static void cli_conn_free(cli_conn_t *conn) {
         pp = &(*pp)->next;
     }
     log_info("CLI session ended for fd %d", conn->fd);
+    runtime_metrics_cli_connection_closed();
     epoll_ctl(cli_epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
     close(conn->fd);
     free(conn);
@@ -76,10 +78,12 @@ static int cli_write(int fd, const char *buf, size_t len) {
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            runtime_metrics_cli_error();
             log_warn("cli fd %d send buffer full; response truncated", fd);
             return -1;
         }
         if (n < 0) {
+            runtime_metrics_cli_error();
             log_warn("write cli fd %d failed: %s", fd, strerror(errno));
             return -1;
         }
@@ -135,6 +139,8 @@ static void send_welcome_prompt(int conn) {
     const char *welcome = "=== Netlink Agent CLI ===\n"
                          "Available commands:\n"
                          "  show interfaces, list - Display interface status\n"
+                         "  show interface <ifname> - Display one interface\n"
+                         "  show metrics - Display runtime metrics\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n"
                          "\n> ";
@@ -153,6 +159,42 @@ static void free_iface_list_copy(iface_info_t *list) {
         free(list);
         list = next;
     }
+}
+
+static void send_metrics(int conn) {
+    runtime_metrics_snapshot_t snapshot;
+    runtime_metrics_get_snapshot(&snapshot);
+
+    char line[1024];
+    int len = snprintf(line, sizeof(line),
+        "=== Runtime Metrics ===\n"
+        "netlink_events_total %llu\n"
+        "link_events_total %llu\n"
+        "addr_events_total %llu\n"
+        "route_events_total %llu\n"
+        "netlink_errors_total %llu\n"
+        "netlink_overruns_total %llu\n"
+        "netlink_truncated_total %llu\n"
+        "last_netlink_event_ts %ld\n"
+        "cli_connections_total %llu\n"
+        "cli_active_connections %llu\n"
+        "cli_commands_total %llu\n"
+        "cli_errors_total %llu\n"
+        "iface_count %d\n",
+        (unsigned long long)snapshot.netlink_events_total,
+        (unsigned long long)snapshot.link_events_total,
+        (unsigned long long)snapshot.addr_events_total,
+        (unsigned long long)snapshot.route_events_total,
+        (unsigned long long)snapshot.netlink_errors_total,
+        (unsigned long long)snapshot.netlink_overruns_total,
+        (unsigned long long)snapshot.netlink_truncated_total,
+        (long)snapshot.last_netlink_event_ts,
+        (unsigned long long)snapshot.cli_connections_total,
+        (unsigned long long)snapshot.cli_active_connections,
+        (unsigned long long)snapshot.cli_commands_total,
+        (unsigned long long)snapshot.cli_errors_total,
+        snapshot.iface_count);
+    cli_write(conn, line, (size_t)len);
 }
 
 static void send_iface_info(int conn, const iface_info_t *inf) {
@@ -191,6 +233,8 @@ static void send_iface_info(int conn, const iface_info_t *inf) {
 
 // Handle individual command
 static int handle_command(int conn, const char *command) {
+    runtime_metrics_cli_command();
+
     if (strncmp(command, "show interfaces", 15) == 0 || strncmp(command, "list", 4) == 0) {
         iface_info_t *safe_list = get_iface_list_safe();
         int total_interfaces = 0;
@@ -206,6 +250,10 @@ static int handle_command(int conn, const char *command) {
             send_iface_info(conn, inf);
         }
         free_iface_list_copy(safe_list);
+        return 0;
+    }
+    else if (strncmp(command, "show metrics", 12) == 0) {
+        send_metrics(conn);
         return 0;
     }
     else if (strncmp(command, "show interface ", 15) == 0) {
@@ -230,6 +278,7 @@ static int handle_command(int conn, const char *command) {
         const char *help = "Available commands:\n"
                          "  show interfaces, list - Display all interface status\n"
                          "  show interface <ifname> - Display one interface\n"
+                         "  show metrics - Display runtime metrics\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n";
         cli_write(conn, help, strlen(help));
@@ -241,6 +290,7 @@ static int handle_command(int conn, const char *command) {
         return 1;
     }
     else {
+        runtime_metrics_cli_error();
         const char *resp = "Unknown command. Type 'help' for available commands.\n";
         cli_write(conn, resp, strlen(resp));
         return 0;
@@ -290,6 +340,7 @@ static void handle_cli_data(cli_conn_t *conn) {
         if (n > 0) {
             int space = (int)sizeof(conn->buf) - conn->buf_len - 1;
             if (space <= 0) {
+                runtime_metrics_cli_error();
                 cli_write(conn->fd, "Command line too long\n", 22);
                 cli_conn_free(conn);
                 return;
@@ -304,6 +355,7 @@ static void handle_cli_data(cli_conn_t *conn) {
                 return;
             }
             if (copy_len < n) {
+                runtime_metrics_cli_error();
                 cli_write(conn->fd, "Command line too long\n", 22);
                 cli_conn_free(conn);
                 return;
@@ -322,6 +374,7 @@ static void handle_cli_data(cli_conn_t *conn) {
             return;
         }
 
+        runtime_metrics_cli_error();
         log_warn("read cli fd %d failed: %s", conn->fd, strerror(errno));
         cli_conn_free(conn);
         return;
@@ -339,19 +392,24 @@ void cli_handle_connection(int fd) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     return;
                 }
+                runtime_metrics_cli_error();
                 log_err("accept cli conn failed: %s", strerror(errno));
                 return;
             }
 
             log_info("New CLI connection accepted on fd %d", conn);
+            runtime_metrics_cli_connection_opened();
 
             if (make_socket_non_blocking(conn) < 0) {
+                runtime_metrics_cli_connection_closed();
                 close(conn);
                 continue;
             }
 
             cli_conn_t *state = calloc(1, sizeof(cli_conn_t));
             if (!state) {
+                runtime_metrics_cli_error();
+                runtime_metrics_cli_connection_closed();
                 log_err("Failed to allocate CLI connection state");
                 close(conn);
                 continue;
@@ -365,6 +423,7 @@ void cli_handle_connection(int fd) {
             ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
             ev.data.fd = conn;
             if (epoll_ctl(cli_epoll_fd, EPOLL_CTL_ADD, conn, &ev) < 0) {
+                runtime_metrics_cli_error();
                 log_err("epoll_ctl add cli conn failed: %s", strerror(errno));
                 cli_conn_free(state);
                 continue;
@@ -378,6 +437,7 @@ void cli_handle_connection(int fd) {
     if (state) {
         handle_cli_data(state);
     } else {
+        runtime_metrics_cli_error();
         log_warn("event for unknown CLI fd %d", fd);
         epoll_ctl(cli_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
         close(fd);

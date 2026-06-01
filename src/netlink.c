@@ -2,6 +2,7 @@
 #include "netlink.h"
 #include "parser.h"
 #include "logger.h"
+#include "runtime_metrics.h"
 
 #include <sys/socket.h>
 #include <linux/netlink.h>
@@ -255,9 +256,11 @@ void process_netlink_messages(void) {
                 break;
             }
             if (errno == ENOBUFS) {
+                runtime_metrics_inc_netlink_overrun();
                 log_warn("netlink receive buffer overrun: %s", strerror(errno));
                 continue;
             }
+            runtime_metrics_inc_netlink_error();
             log_err("recvmsg nl_sock failed: %s", strerror(errno));
             break;
         }
@@ -266,6 +269,7 @@ void process_netlink_messages(void) {
             break;
         }
         if (msg.msg_flags & MSG_TRUNC) {
+            runtime_metrics_inc_netlink_truncated();
             log_warn("netlink message truncated; consider increasing receive buffer");
             continue;
         }
@@ -275,6 +279,7 @@ void process_netlink_messages(void) {
             if (nlh->nlmsg_type == NLMSG_ERROR) {
                 struct nlmsgerr *err = NLMSG_DATA(nlh);
                 if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(*err)) && err->error != 0) {
+                    runtime_metrics_inc_netlink_error();
                     log_warn("netlink reported error: %s", strerror(-err->error));
                 }
                 continue;
@@ -283,6 +288,7 @@ void process_netlink_messages(void) {
                 log_info("netlink dump completed");
                 continue;
             }
+            runtime_metrics_record_netlink_event(nlh->nlmsg_type);
             switch (nlh->nlmsg_type) {
                 case RTM_NEWLINK:
                 case RTM_DELLINK:
@@ -302,6 +308,7 @@ void process_netlink_messages(void) {
             }
         }
         if (remaining > 0) {
+            runtime_metrics_inc_netlink_error();
             log_warn("netlink message parse stopped with %zd trailing bytes", remaining);
         }
     }
