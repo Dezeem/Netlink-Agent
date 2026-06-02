@@ -22,6 +22,13 @@
 static int nl_sock = -1;
 int netlink_fd(void) { return nl_sock; }
 
+/* event queue (producer side: epoll thread pushes here) */
+static event_queue_t *nl_event_queue = NULL;
+
+void netlink_set_event_queue(event_queue_t *q) {
+    nl_event_queue = q;
+}
+
 static int make_socket_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -190,6 +197,30 @@ static void handle_route_msg(struct nlmsghdr *nlh) {
     /* Could update route-related structures here; for now just log */
 }
 
+/* Dispatcher (called from worker thread) */
+void netlink_dispatch_event(nl_event_t *event) {
+    struct nlmsghdr *nlh = (struct nlmsghdr *)event->data;
+
+    runtime_metrics_record_netlink_event(event->nlmsg_type);
+
+    switch (event->nlmsg_type) {
+        case RTM_NEWLINK:
+        case RTM_DELLINK:
+            handle_link_msg(nlh);
+            break;
+        case RTM_NEWADDR:
+        case RTM_DELADDR:
+            handle_addr_msg(nlh);
+            break;
+        case RTM_NEWROUTE:
+        case RTM_DELROUTE:
+            handle_route_msg(nlh);
+            break;
+        default:
+            break;
+    }
+}
+
 /* start netlink socket and register to epoll */
 int netlink_start(int epoll_fd) {
     nl_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -288,23 +319,21 @@ void process_netlink_messages(void) {
                 log_info("netlink dump completed");
                 continue;
             }
-            runtime_metrics_record_netlink_event(nlh->nlmsg_type);
-            switch (nlh->nlmsg_type) {
-                case RTM_NEWLINK:
-                case RTM_DELLINK:
-                    handle_link_msg(nlh);
-                    break;
-                case RTM_NEWADDR:
-                case RTM_DELADDR:
-                    handle_addr_msg(nlh);
-                    break;
-                case RTM_NEWROUTE:
-                case RTM_DELROUTE:
-                    handle_route_msg(nlh);
-                    break;
-                default:
-                    /* skip other types */
-                    break;
+
+            /* push to queue (worker thread dispatches) */
+            if (nl_event_queue) {
+                nl_event_t *event = nl_event_from_nlh(nlh);
+                if (!event) {
+                    runtime_metrics_inc_netlink_error();
+                    continue;
+                }
+                if (!event_queue_push(nl_event_queue, event)) {
+                    /* backpressure: queue full, drop oldest-style */
+                    runtime_metrics_inc_netlink_dropped();
+                    log_warn("event queue full, dropping event type=%d", nlh->nlmsg_type);
+                    free(event);
+                    continue;
+                }
             }
         }
         if (remaining > 0) {

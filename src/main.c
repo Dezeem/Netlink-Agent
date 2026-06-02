@@ -14,6 +14,8 @@
 #include "alert.h"
 #include "cli.h"
 #include "netlink.h"
+#include "event_queue.h"
+#include "event_worker.h"
 
 // declare process_netlink_messages from netlink.c
 void process_netlink_messages(void);
@@ -80,6 +82,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Phase 2.5: SPSC event queue + worker thread
+    event_queue_t eq;
+    if (event_queue_init(&eq) < 0) {
+        log_err("event_queue_init failed");
+        return 1;
+    }
+    netlink_set_event_queue(&eq);
+
+    if (event_worker_start(&eq) < 0) {
+        log_err("event_worker_start failed");
+        event_queue_destroy(&eq);
+        return 1;
+    }
+
     const int MAX_EVENTS = 10;
     struct epoll_event events[MAX_EVENTS];
 
@@ -121,6 +137,9 @@ int main(int argc, char **argv) {
     }
 
     log_info("nlagent exiting");
+
+    event_worker_stop();
+    event_queue_destroy(&eq);
     close(epfd);
     return 0;
 }

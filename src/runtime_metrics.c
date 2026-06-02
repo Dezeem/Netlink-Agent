@@ -61,6 +61,12 @@ void runtime_metrics_inc_netlink_truncated(void) {
     metrics_lock_release();
 }
 
+void runtime_metrics_inc_netlink_dropped(void) {
+    metrics_lock_acquire();
+    metrics.netlink_dropped_total++;
+    metrics_lock_release();
+}
+
 void runtime_metrics_cli_connection_opened(void) {
     metrics_lock_acquire();
     metrics.cli_connections_total++;
