@@ -535,9 +535,8 @@ static int parse_netlink_stats_response(struct nlmsghdr *nlh, iface_info_t *ifac
 
     // Extract statistics if available
     if (tb[IFLA_STATS64]) {
-        struct rtnl_link_stats64 *stats = RTA_DATA(tb[IFLA_STATS64]);
-        iface->stats = *stats;
-        sync_legacy_stats_fields(iface);
+        const void *stats = RTA_DATA(tb[IFLA_STATS64]);
+        memcpy(&iface->stats, stats, sizeof(iface->stats));
         return 1;
     }
 
