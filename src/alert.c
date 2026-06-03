@@ -42,8 +42,8 @@ static iface_tracker_t *get_or_create_tracker(iface_info_t *iface) {
     }
     t->ifindex = iface->ifindex;
     snprintf(t->ifname, IFNAMSIZ, "%s", iface->ifname);
-    t->prev_rx = iface->rx_bytes;
-    t->prev_tx = iface->tx_bytes;
+    t->prev_rx = (unsigned long)iface->stats.rx_bytes;
+    t->prev_tx = (unsigned long)iface->stats.tx_bytes;
     t->next = trackers;
     trackers = t;
     return t;
@@ -76,13 +76,19 @@ static void alert_check_callback(iface_info_t *iface, void *data) {
 
     tracker->seen = 1;
 
-    if (iface->rx_err > ERR_THRESHOLD || iface->tx_err > ERR_THRESHOLD) {
-        log_warn("interface %s has rx_err=%lu tx_err=%lu", iface->ifname, iface->rx_err, iface->tx_err);
+    if ((unsigned long)iface->stats.rx_errors > ERR_THRESHOLD
+        || (unsigned long)iface->stats.tx_errors > ERR_THRESHOLD) {
+        log_warn("interface %s has rx_err=%lu tx_err=%lu",
+                 iface->ifname,
+                 (unsigned long)iface->stats.rx_errors,
+                 (unsigned long)iface->stats.tx_errors);
     }
 
     if (elapsed > 0) {
-        unsigned long rx_diff = iface->rx_bytes >= tracker->prev_rx ? iface->rx_bytes - tracker->prev_rx : 0;
-        unsigned long tx_diff = iface->tx_bytes >= tracker->prev_tx ? iface->tx_bytes - tracker->prev_tx : 0;
+        unsigned long cur_rx = (unsigned long)iface->stats.rx_bytes;
+        unsigned long cur_tx = (unsigned long)iface->stats.tx_bytes;
+        unsigned long rx_diff = cur_rx >= tracker->prev_rx ? cur_rx - tracker->prev_rx : 0;
+        unsigned long tx_diff = cur_tx >= tracker->prev_tx ? cur_tx - tracker->prev_tx : 0;
         double rx_rate = rx_diff / elapsed;
         (void)tx_diff;
 
@@ -91,8 +97,8 @@ static void alert_check_callback(iface_info_t *iface, void *data) {
         }
     }
 
-    tracker->prev_rx = iface->rx_bytes;
-    tracker->prev_tx = iface->tx_bytes;
+    tracker->prev_rx = (unsigned long)iface->stats.rx_bytes;
+    tracker->prev_tx = (unsigned long)iface->stats.tx_bytes;
 }
 
 void alert_check_cycle(void) {

@@ -18,16 +18,7 @@ typedef struct iface_info {
     char ifname[IFNAMSIZ];
     int ifindex;
     int up;
-    
-    // Full Netlink statistics structure
     struct rtnl_link_stats64 stats;
-    
-    // Legacy fields for backward compatibility
-    unsigned long rx_bytes;
-    unsigned long tx_bytes;
-    unsigned long rx_err;
-    unsigned long tx_err;
-
     iface_addr_t addrs[MAX_ADDR_PER_IF];
     int addr_cnt;
     struct iface_info *next;
@@ -51,8 +42,6 @@ iface_info_t *get_iface_by_index(int ifindex);
 iface_info_t *get_iface_by_name(const char *ifname);
 void update_iface_status(int ifindex, int up);
 void upsert_iface_link(int ifindex, const char *ifname, int up);
-void update_iface_counters(int ifindex, unsigned long rx_bytes, unsigned long tx_bytes, unsigned long rx_err, unsigned long tx_err);
-void update_iface_ip(int ifindex, const char *ip); /* ip==NULL clears the stored ip */
 void list_interfaces(void);
 iface_info_t *ensure_iface_by_index(int ifindex, const char *ifname);
 void delete_iface_by_index(int ifindex);
@@ -74,8 +63,5 @@ void update_all_iface_performance_data(void);
 // Netlink-based performance data functions
 int update_iface_stats_via_netlink(iface_info_t *iface);
 void update_all_iface_stats_via_netlink(void);
-
-// Helper functions for statistics synchronization
-void sync_legacy_stats_fields(iface_info_t *iface);
 
 #endif

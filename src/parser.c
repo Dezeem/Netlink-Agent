@@ -125,10 +125,6 @@ void init_iface_table(void) {
         new_iface->ifname[IFNAMSIZ - 1] = '\0';
         new_iface->ifindex = if_nametoindex(ifa->ifa_name);
         new_iface->up = (ifa->ifa_flags & IFF_UP) ? 1 : 0;
-        new_iface->rx_bytes = 0;
-        new_iface->tx_bytes = 0;
-        new_iface->rx_err = 0;
-        new_iface->tx_err = 0;
         new_iface->addr_cnt = 0;
         
         // add to the head of the list
@@ -199,43 +195,6 @@ void upsert_iface_link(int ifindex, const char *ifname, int up) {
     inf->up = up;
     log_info("iface %s (idx %d) status -> %s", inf->ifname, ifindex, up ? "UP" : "DOWN");
     iface_list_unlock();
-}
-
-void update_iface_counters(int ifindex, unsigned long rx_bytes, unsigned long tx_bytes, 
-                          unsigned long rx_err, unsigned long tx_err) {
-    iface_info_t *inf = get_iface_by_index(ifindex);
-    if (!inf) return;
-    inf->rx_bytes = rx_bytes;
-    inf->tx_bytes = tx_bytes;
-    inf->rx_err = rx_err;
-    inf->tx_err = tx_err;
-}
-
-/* update IP (old function, for compatibility) */
-void update_iface_ip(int ifindex, const char *ip) {
-    iface_info_t *inf = get_iface_by_index(ifindex);
-    if (!inf) return;
-    
-    // only update the first IPv4 address as the primary IP (for compatibility with old code)
-    for (int i = 0; i < inf->addr_cnt; i++) {
-        if (inf->addrs[i].family == AF_INET) {
-            strncpy(inf->addrs[i].addr, ip, INET6_ADDRSTRLEN - 1);
-            inf->addrs[i].addr[INET6_ADDRSTRLEN - 1] = '\0';
-            log_info("updated IP for iface %s (idx %d) -> %s", 
-                    inf->ifname, ifindex, ip);
-            return;
-        }
-    }
-    
-    // if no IPv4 address, add one
-    if (inf->addr_cnt < MAX_ADDR_PER_IF) {
-        inf->addrs[inf->addr_cnt].family = AF_INET;
-        strncpy(inf->addrs[inf->addr_cnt].addr, ip, INET6_ADDRSTRLEN - 1);
-        inf->addrs[inf->addr_cnt].addr[INET6_ADDRSTRLEN - 1] = '\0';
-        inf->addr_cnt++;
-        log_info("added IP for iface %s (idx %d) -> %s", 
-                inf->ifname, ifindex, ip);
-    }
 }
 
 void iface_add_addr(iface_info_t *inf, int family, const char *addr, int prefixlen) {
@@ -326,7 +285,10 @@ void list_interfaces(void) {
         printf("Interface: %s\n", p->ifname);
         printf("  Index: %d, Status: %s\n", p->ifindex, p->up ? "UP" : "DOWN");
         printf("  Counters: RX=%lu TX=%lu RX_ERR=%lu TX_ERR=%lu\n",
-               p->rx_bytes, p->tx_bytes, p->rx_err, p->tx_err);
+               (unsigned long)p->stats.rx_bytes,
+               (unsigned long)p->stats.tx_bytes,
+               (unsigned long)p->stats.rx_errors,
+               (unsigned long)p->stats.tx_errors);
         
         if (p->addr_cnt > 0) {
             printf("  Addresses (%d):\n", p->addr_cnt);
@@ -427,16 +389,10 @@ int update_iface_performance_data(iface_info_t *iface) {
     snprintf(rxerr_path, sizeof(rxerr_path), "/sys/class/net/%s/statistics/rx_errors", iface->ifname);
     snprintf(txerr_path, sizeof(txerr_path), "/sys/class/net/%s/statistics/tx_errors", iface->ifname);
     
-    iface->rx_bytes = read_ull_file(rx_path);
-    iface->tx_bytes = read_ull_file(tx_path);
-    iface->rx_err = read_ull_file(rxerr_path);
-    iface->tx_err = read_ull_file(txerr_path);
-    
-    // Also update the new stats structure for consistency
-    iface->stats.rx_bytes = iface->rx_bytes;
-    iface->stats.tx_bytes = iface->tx_bytes;
-    iface->stats.rx_errors = iface->rx_err;
-    iface->stats.tx_errors = iface->tx_err;
+    iface->stats.rx_bytes   = read_ull_file(rx_path);
+    iface->stats.tx_bytes   = read_ull_file(tx_path);
+    iface->stats.rx_errors  = read_ull_file(rxerr_path);
+    iface->stats.tx_errors  = read_ull_file(txerr_path);
     
     return 0;
 }
@@ -446,17 +402,6 @@ void update_all_iface_performance_data(void) {
     for (iface_info_t *p = iface_list; p; p = p->next) {
         update_iface_performance_data(p);
     }
-}
-
-// Helper function to synchronize legacy statistics fields
-void sync_legacy_stats_fields(iface_info_t *iface) {
-    if (!iface) return;
-    
-    // Sync the legacy fields with the new stats structure
-    iface->rx_bytes = iface->stats.rx_bytes;
-    iface->tx_bytes = iface->stats.tx_bytes;
-    iface->rx_err = iface->stats.rx_errors;
-    iface->tx_err = iface->stats.tx_errors;
 }
 
 // Send Netlink request to get interface statistics
