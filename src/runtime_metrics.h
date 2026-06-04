@@ -13,6 +13,9 @@ typedef struct runtime_metrics_snapshot {
     uint64_t netlink_overruns_total;
     uint64_t netlink_truncated_total;
     uint64_t netlink_dropped_total;
+    uint64_t worker_events_total;
+    uint64_t queue_depth_current;
+    uint64_t queue_depth_max;
     time_t last_netlink_event_ts;
 
     uint64_t cli_connections_total;
@@ -28,6 +31,8 @@ void runtime_metrics_inc_netlink_error(void);
 void runtime_metrics_inc_netlink_overrun(void);
 void runtime_metrics_inc_netlink_truncated(void);
 void runtime_metrics_inc_netlink_dropped(void);
+void runtime_metrics_inc_worker_event(void);
+void runtime_metrics_record_queue_depth(uint64_t depth);
 
 void runtime_metrics_cli_connection_opened(void);
 void runtime_metrics_cli_connection_closed(void);

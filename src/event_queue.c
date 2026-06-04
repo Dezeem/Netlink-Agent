@@ -66,6 +66,13 @@ bool event_queue_full(const event_queue_t *q)
     return (head - tail) >= EVENT_QUEUE_CAPACITY;
 }
 
+uint64_t event_queue_depth(const event_queue_t *q)
+{
+    uint64_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    uint64_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    return head - tail;
+}
+
 /* nl_event factory */
 nl_event_t *nl_event_from_nlh(struct nlmsghdr *nlh)
 {

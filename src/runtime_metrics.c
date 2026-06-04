@@ -67,6 +67,20 @@ void runtime_metrics_inc_netlink_dropped(void) {
     metrics_lock_release();
 }
 
+void runtime_metrics_inc_worker_event(void) {
+    metrics_lock_acquire();
+    metrics.worker_events_total++;
+    metrics_lock_release();
+}
+
+void runtime_metrics_record_queue_depth(uint64_t depth) {
+    metrics_lock_acquire();
+    metrics.queue_depth_current = depth;
+    if (depth > metrics.queue_depth_max)
+        metrics.queue_depth_max = depth;
+    metrics_lock_release();
+}
+
 void runtime_metrics_cli_connection_opened(void) {
     metrics_lock_acquire();
     metrics.cli_connections_total++;

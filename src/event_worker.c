@@ -26,11 +26,12 @@ static void *worker_main(void *arg)
     while (g_running) {
         nl_event_t *event = event_queue_pop(q);
         if (event) {
-            /* Sentinel type-0 tells us to stop */
             if (event->nlmsg_type == 0) {
                 free(event);
                 continue;
             }
+            runtime_metrics_inc_worker_event();
+            runtime_metrics_record_queue_depth(event_queue_depth(q));
             netlink_dispatch_event(event);
             free(event);
         } else {

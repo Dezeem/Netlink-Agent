@@ -29,6 +29,7 @@ void         event_queue_destroy(event_queue_t *q);
 bool         event_queue_push(event_queue_t *q, nl_event_t *event);
 nl_event_t  *event_queue_pop(event_queue_t *q);
 bool         event_queue_full(const event_queue_t *q);
+uint64_t     event_queue_depth(const event_queue_t *q);
 
 /* Helper: allocate + copy an nl_event from a nlmsghdr */
 nl_event_t  *nl_event_from_nlh(struct nlmsghdr *nlh);

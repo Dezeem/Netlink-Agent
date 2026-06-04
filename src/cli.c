@@ -171,12 +171,17 @@ static void send_metrics(int conn) {
     int len = snprintf(line, sizeof(line),
         "=== Runtime Metrics ===\n"
         "netlink_events_total %llu\n"
-        "link_events_total %llu\n"
-        "addr_events_total %llu\n"
-        "route_events_total %llu\n"
+        "  link_events %llu\n"
+        "  addr_events %llu\n"
+        "  route_events %llu\n"
         "netlink_errors_total %llu\n"
         "netlink_overruns_total %llu\n"
         "netlink_truncated_total %llu\n"
+        "netlink_dropped_total %llu\n"
+        "worker_events_total %llu\n"
+        "queue_depth_current %llu\n"
+        "queue_depth_max %llu\n"
+        "backpressure_pct %.1f%c\n"
         "last_netlink_event_ts %ld\n"
         "cli_connections_total %llu\n"
         "cli_active_connections %llu\n"
@@ -190,6 +195,15 @@ static void send_metrics(int conn) {
         (unsigned long long)snapshot.netlink_errors_total,
         (unsigned long long)snapshot.netlink_overruns_total,
         (unsigned long long)snapshot.netlink_truncated_total,
+        (unsigned long long)snapshot.netlink_dropped_total,
+        (unsigned long long)snapshot.worker_events_total,
+        (unsigned long long)snapshot.queue_depth_current,
+        (unsigned long long)snapshot.queue_depth_max,
+        snapshot.netlink_events_total > 0
+            ? 100.0 * (double)snapshot.netlink_dropped_total
+                   / (double)snapshot.netlink_events_total
+            : 0.0,
+        '%',
         (long)snapshot.last_netlink_event_ts,
         (unsigned long long)snapshot.cli_connections_total,
         (unsigned long long)snapshot.cli_active_connections,
