@@ -24,6 +24,21 @@ typedef struct iface_info {
     struct iface_info *next;
 } iface_info_t;
 
+/* ── Route table ─────────────────────────────── */
+
+typedef struct route_info {
+    int    family;
+    int    prefixlen;
+    int    oif;                           /* output interface index */
+    int    rtm_type;                      /* RTN_UNICAST / RTN_LOCAL / ... */
+    int    rtm_protocol;                  /* RTPROT_KERNEL / RTPROT_BOOT / ... */
+    char   dst[INET6_ADDRSTRLEN];
+    char   gateway[INET6_ADDRSTRLEN];
+    struct route_info *next;
+} route_info_t;
+
+extern pthread_rwlock_t route_list_lock;
+
 // Thread-safe interface management
 extern pthread_rwlock_t iface_list_lock;
 
@@ -63,5 +78,15 @@ void update_all_iface_performance_data(void);
 // Netlink-based performance data functions
 int update_iface_stats_via_netlink(iface_info_t *iface);
 void update_all_iface_stats_via_netlink(void);
+
+// Route table management
+void         route_upsert(int family, const char *dst, int prefixlen, int oif,
+                          const char *gateway, int rtm_type, int rtm_protocol);
+void         route_delete(int family, const char *dst, int prefixlen);
+route_info_t *get_route_list(void);
+void         list_routes(void);
+void         route_list_rdlock(void);
+void         route_list_wrlock(void);
+void         route_list_unlock(void);
 
 #endif

@@ -25,6 +25,9 @@ int netlink_fd(void) { return nl_sock; }
 /* event queue (producer side: epoll thread pushes here) */
 static event_queue_t *nl_event_queue = NULL;
 
+/* deferred route dump: sent after addr dump completes */
+static int pending_route_dump = 0;
+
 void netlink_set_event_queue(event_queue_t *q) {
     nl_event_queue = q;
 }
@@ -98,6 +101,34 @@ static int send_nl_addr_dump_req(int sock)
         log_err("send RTM_GETADDR failed: %s", strerror(errno));
     }
 
+    return ret;
+}
+
+static int send_nl_route_dump_req(int sock)
+{
+    struct {
+        struct nlmsghdr nlh;
+        struct rtmsg      rt;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nlh.nlmsg_type  = RTM_GETROUTE;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq   = time(NULL);
+    req.nlh.nlmsg_pid   = getpid();
+    req.rt.rtm_family   = AF_UNSPEC;
+
+    struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK, .nl_pid = 0 };
+    struct iovec iov = { .iov_base = &req, .iov_len = req.nlh.nlmsg_len };
+    struct msghdr msg = {
+        .msg_name = &nladdr, .msg_namelen = sizeof(nladdr),
+        .msg_iov = &iov, .msg_iovlen = 1,
+    };
+
+    int ret = sendmsg(sock, &msg, 0);
+    if (ret < 0)
+        log_err("send RTM_GETROUTE failed: %s", strerror(errno));
     return ret;
 }
 
@@ -175,26 +206,43 @@ static void handle_route_msg(struct nlmsghdr *nlh) {
     rtattr_get(tb, RTA_MAX, rta, len);
 
     char dst[INET6_ADDRSTRLEN] = {0};
+    char gateway[INET6_ADDRSTRLEN] = {0};
     int oif = 0;
 
+    /* Destination address */
     if (tb[RTA_DST]) {
         void *addr = RTA_DATA(tb[RTA_DST]);
-        if (rt->rtm_family == AF_INET) {
+        if (rt->rtm_family == AF_INET)
             inet_ntop(AF_INET, addr, dst, sizeof(dst));
-        } else if (rt->rtm_family == AF_INET6) {
+        else if (rt->rtm_family == AF_INET6)
             inet_ntop(AF_INET6, addr, dst, sizeof(dst));
-        }
     } else {
-        /* default route */
-        strcpy(dst, "0.0.0.0/0");
+        strcpy(dst, "0.0.0.0");
     }
 
-    if (tb[RTA_OIF]) {
+    /* Gateway */
+    if (tb[RTA_GATEWAY]) {
+        void *gw = RTA_DATA(tb[RTA_GATEWAY]);
+        if (rt->rtm_family == AF_INET)
+            inet_ntop(AF_INET, gw, gateway, sizeof(gateway));
+        else if (rt->rtm_family == AF_INET6)
+            inet_ntop(AF_INET6, gw, gateway, sizeof(gateway));
+    }
+
+    /* Output interface */
+    if (tb[RTA_OIF])
         oif = *(int *)RTA_DATA(tb[RTA_OIF]);
+
+    if (nlh->nlmsg_type == RTM_NEWROUTE) {
+        route_upsert(rt->rtm_family, dst, rt->rtm_dst_len,
+                     oif, gateway, rt->rtm_type, rt->rtm_protocol);
+    } else if (nlh->nlmsg_type == RTM_DELROUTE) {
+        route_delete(rt->rtm_family, dst, rt->rtm_dst_len);
     }
 
-    log_info("ROUTE event type=%d fam=%d dst=%s oif=%d", nlh->nlmsg_type, rt->rtm_family, dst, oif);
-    /* Could update route-related structures here; for now just log */
+    log_info("ROUTE event type=%d fam=%d dst=%s/%d oif=%d gw=%s",
+             nlh->nlmsg_type, rt->rtm_family, dst, rt->rtm_dst_len, oif,
+             gateway[0] ? gateway : "*");
 }
 
 /* Dispatcher (called from worker thread) */
@@ -260,6 +308,7 @@ int netlink_start(int epoll_fd) {
     log_info("netlink socket started (fd=%d)", nl_sock);
     log_info("syncing netlink state...");
     send_nl_addr_dump_req(nl_sock);
+    pending_route_dump = 1;  /* sent after addr dump completes */
     return nl_sock;
 }
 
@@ -317,6 +366,10 @@ void process_netlink_messages(void) {
             }
             if (nlh->nlmsg_type == NLMSG_DONE) {
                 log_info("netlink dump completed");
+                if (pending_route_dump) {
+                    pending_route_dump = 0;
+                    send_nl_route_dump_req(nl_sock);
+                }
                 continue;
             }
 

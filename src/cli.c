@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "parser.h"
 #include "runtime_metrics.h"
+#include <linux/rtnetlink.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -140,7 +141,8 @@ static void send_welcome_prompt(int conn) {
                          "Available commands:\n"
                          "  show interfaces, list - Display interface status\n"
                          "  show interface <ifname> - Display one interface\n"
-                         "  show metrics - Display runtime metrics\n"
+                         "  show routes            - Display route table\n"
+                         "  show metrics           - Display runtime metrics\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n"
                          "\n> ";
@@ -274,10 +276,46 @@ static int handle_command(int conn, const char *command) {
         send_iface_info(conn, &snapshot);
         return 0;
     }
+    else if (strncmp(command, "show routes", 11) == 0) {
+        route_list_rdlock();
+        int count = 0;
+        for (route_info_t *r = get_route_list(); r; r = r->next) count++;
+
+        char line[256];
+        int len = snprintf(line, sizeof(line), "=== Route Table (%d entries) ===\n", count);
+        cli_write(conn, line, (size_t)len);
+
+        len = snprintf(line, sizeof(line), "%-20s %-7s %-16s %s\n",
+                       "Destination", "Proto", "Gateway", "OIF");
+        cli_write(conn, line, (size_t)len);
+
+        for (route_info_t *r = get_route_list(); r; r = r->next) {
+            char dst_prefix[INET6_ADDRSTRLEN + 5];
+            snprintf(dst_prefix, sizeof(dst_prefix), "%s/%d",
+                     r->dst[0] ? r->dst : "default", r->prefixlen);
+
+            char ifname[IFNAMSIZ] = "*";
+            iface_info_t *iface = get_iface_by_index(r->oif);
+            if (iface) snprintf(ifname, IFNAMSIZ, "%s", iface->ifname);
+
+            len = snprintf(line, sizeof(line), "%-20s %-7s %-16s %s\n",
+                           dst_prefix,
+                           r->rtm_protocol == RTPROT_KERNEL ? "kernel" :
+                           r->rtm_protocol == RTPROT_BOOT  ? "boot"   :
+                           r->rtm_protocol == RTPROT_STATIC ? "static" :
+                           r->rtm_protocol == RTPROT_DHCP  ? "dhcp"   : "?",
+                           r->gateway[0] ? r->gateway : "*",
+                           ifname);
+            cli_write(conn, line, (size_t)len);
+        }
+        route_list_unlock();
+        return 0;
+    }
     else if (strncmp(command, "help", 4) == 0) {
         const char *help = "Available commands:\n"
                          "  show interfaces, list - Display all interface status\n"
                          "  show interface <ifname> - Display one interface\n"
+                         "  show routes - Display route table\n"
                          "  show metrics - Display runtime metrics\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n";

@@ -21,6 +21,9 @@ static int iface_count = 0;
 
 // Thread-safe lock for iface_list
 pthread_rwlock_t iface_list_lock = PTHREAD_RWLOCK_INITIALIZER;
+pthread_rwlock_t route_list_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static route_info_t *route_list = NULL;
 
 // list management helper functions
 static iface_info_t *create_iface_node(void) {
@@ -359,6 +362,111 @@ void foreach_iface(void (*callback)(iface_info_t *iface, void *data), void *data
         callback(p, data);
     }
     iface_list_unlock();
+}
+
+/* ── Route table management ─────────────────────────── */
+
+void route_list_rdlock(void) { pthread_rwlock_rdlock(&route_list_lock); }
+void route_list_wrlock(void) { pthread_rwlock_wrlock(&route_list_lock); }
+void route_list_unlock(void) { pthread_rwlock_unlock(&route_list_lock); }
+
+route_info_t *get_route_list(void) { return route_list; }
+
+void route_upsert(int family, const char *dst, int prefixlen, int oif,
+                  const char *gateway, int rtm_type, int rtm_protocol)
+{
+    if (!dst || !dst[0]) return;
+
+    route_list_wrlock();
+
+    /* Update existing route if found (same dst + family + prefixlen) */
+    for (route_info_t *r = route_list; r; r = r->next) {
+        if (r->family == family
+            && r->prefixlen == prefixlen
+            && strcmp(r->dst, dst) == 0) {
+            r->oif = oif;
+            if (gateway && gateway[0])
+                snprintf(r->gateway, INET6_ADDRSTRLEN, "%s", gateway);
+            r->rtm_type = rtm_type;
+            r->rtm_protocol = rtm_protocol;
+            route_list_unlock();
+            return;
+        }
+    }
+
+    /* Insert at head */
+    route_info_t *new_route = calloc(1, sizeof(route_info_t));
+    if (!new_route) {
+        log_err("failed to allocate route entry");
+        route_list_unlock();
+        return;
+    }
+    new_route->family = family;
+    new_route->prefixlen = prefixlen;
+    new_route->oif = oif;
+    new_route->rtm_type = rtm_type;
+    new_route->rtm_protocol = rtm_protocol;
+    snprintf(new_route->dst, INET6_ADDRSTRLEN, "%s", dst);
+    if (gateway && gateway[0])
+        snprintf(new_route->gateway, INET6_ADDRSTRLEN, "%s", gateway);
+    new_route->next = route_list;
+    route_list = new_route;
+
+    log_info("route add: %s/%d oif=%d type=%d proto=%d",
+             dst, prefixlen, oif, rtm_type, rtm_protocol);
+
+    route_list_unlock();
+}
+
+void route_delete(int family, const char *dst, int prefixlen)
+{
+    if (!dst || !dst[0]) return;
+
+    route_list_wrlock();
+
+    route_info_t **pp = &route_list;
+    while (*pp) {
+        route_info_t *r = *pp;
+        if (r->family == family
+            && r->prefixlen == prefixlen
+            && strcmp(r->dst, dst) == 0) {
+            *pp = r->next;
+            log_info("route del: %s/%d", dst, prefixlen);
+            free(r);
+            route_list_unlock();
+            return;
+        }
+        pp = &r->next;
+    }
+
+    route_list_unlock();
+}
+
+void list_routes(void)
+{
+    route_list_rdlock();
+    int count = 0;
+    for (route_info_t *r = route_list; r; r = r->next) count++;
+    printf("=== Route Table (%d entries) ===\n", count);
+    printf("%-20s %-7s %-8s %s\n", "Destination", "Proto", "Gateway", "OIF");
+    printf("%-20s %-7s %-8s %s\n", "-----------", "-----", "-------", "---");
+    for (route_info_t *r = route_list; r; r = r->next) {
+        char dst_prefix[INET6_ADDRSTRLEN + 5];
+        snprintf(dst_prefix, sizeof(dst_prefix), "%s/%d",
+                 r->dst[0] ? r->dst : "default", r->prefixlen);
+        char ifname[IFNAMSIZ] = "*";
+        iface_info_t *iface = get_iface_by_index(r->oif);
+        if (iface) snprintf(ifname, IFNAMSIZ, "%s", iface->ifname);
+        printf("%-20s %-7s %-8s %s\n",
+               dst_prefix,
+               r->rtm_protocol == RTPROT_KERNEL ? "kernel" :
+               r->rtm_protocol == RTPROT_BOOT  ? "boot"   :
+               r->rtm_protocol == RTPROT_STATIC ? "static" :
+               r->rtm_protocol == RTPROT_DHCP  ? "dhcp"   : "?",
+               r->gateway[0] ? r->gateway : "*",
+               ifname);
+    }
+    route_list_unlock();
 }
 
 // Helper function to read unsigned long from sysfs file
