@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "parser.h"
 #include "runtime_metrics.h"
+#include "config.h"
 #include <linux/rtnetlink.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -143,6 +144,7 @@ static void send_welcome_prompt(int conn) {
                          "  show interface <ifname> - Display one interface\n"
                          "  show routes            - Display route table\n"
                          "  show metrics           - Display runtime metrics\n"
+                         "  reload                 - Hot-reload config\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n"
                          "\n> ";
@@ -325,12 +327,18 @@ static int handle_command(int conn, const char *command) {
         route_list_unlock();
         return 0;
     }
+    else if (strncmp(command, "reload", 6) == 0) {
+        config_reload();
+        cli_write(conn, "Config reloaded.\n", 17);
+        return 0;
+    }
     else if (strncmp(command, "help", 4) == 0) {
         const char *help = "Available commands:\n"
                          "  show interfaces, list - Display all interface status\n"
                          "  show interface <ifname> - Display one interface\n"
                          "  show routes - Display route table\n"
                          "  show metrics - Display runtime metrics\n"
+                         "  reload - Hot-reload config from environment\n"
                          "  help - Show this help message\n"
                          "  quit, exit - Close connection\n";
         cli_write(conn, help, strlen(help));

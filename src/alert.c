@@ -1,13 +1,11 @@
 #include "alert.h"
 #include "parser.h"
 #include "logger.h"
+#include "config.h"
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-
-#define ERR_THRESHOLD 10
-#define HIGH_RX_RATE_BPS 10000000.0
 
 typedef struct iface_tracker {
     int ifindex;
@@ -76,8 +74,10 @@ static void alert_check_callback(iface_info_t *iface, void *data) {
 
     tracker->seen = 1;
 
-    if ((unsigned long)iface->stats.rx_errors > ERR_THRESHOLD
-        || (unsigned long)iface->stats.tx_errors > ERR_THRESHOLD) {
+    config_t *cfg = atomic_load(&g_config);
+
+    if ((unsigned long)iface->stats.rx_errors > (unsigned long)cfg->error_threshold
+        || (unsigned long)iface->stats.tx_errors > (unsigned long)cfg->error_threshold) {
         log_warn("interface %s has rx_err=%lu tx_err=%lu",
                  iface->ifname,
                  (unsigned long)iface->stats.rx_errors,
@@ -92,7 +92,8 @@ static void alert_check_callback(iface_info_t *iface, void *data) {
         double rx_rate = rx_diff / elapsed;
         (void)tx_diff;
 
-        if (rx_rate > HIGH_RX_RATE_BPS) {
+        double threshold_bps = cfg->traffic_threshold_mbps * 1000000.0;
+        if (rx_rate > threshold_bps) {
             log_warn("high traffic on %s: rx_rate=%.0f B/s", iface->ifname, rx_rate);
         }
     }

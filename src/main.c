@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
@@ -16,23 +17,32 @@
 #include "netlink.h"
 #include "event_queue.h"
 #include "event_worker.h"
+#include "config.h"
+#include "prom.h"
 
 // declare process_netlink_messages from netlink.c
 void process_netlink_messages(void);
 
-static int running = 1;
+static volatile int running = 1;
 static int epfd = -1;
+static int timer_fd = -1;
+static int init_done = 0;
 
-static void sigint_handler(int sig) {
+static void sig_handler(int sig)
+{
+    if (sig == SIGHUP) {
+        config_reload();
+        log_info("config reloaded via SIGHUP");
+        return;
+    }
     log_info("received signal %d, exiting...", sig);
     running = 0;
 }
 
-// Flag to track initialization phase
-static int initialization_complete = 0;
+static int perform_initialization(void)
+{
+    config_init_defaults();
 
-// Function to perform blocking initialization
-static int perform_initialization(void) {
     log_info("Starting initialization phase...");
     
     // Phase 1: Basic interface information
@@ -42,104 +52,82 @@ static int perform_initialization(void) {
     // Phase 2: Complete statistics collection (blocking)
     log_info("Collecting initial statistics...");
     update_all_iface_performance_data();
+
     log_info("Initial statistics collected");
-    
-    // Mark initialization complete
-    initialization_complete = 1;
+    init_done = 1;
     log_info("Initialization phase completed");
-    
     return 0;
 }
 
-int main(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv;
 
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
+    signal(SIGINT,  sig_handler);
+    signal(SIGTERM, sig_handler);
+    signal(SIGHUP,  sig_handler);
 
     log_info("nlagent starting...");
 
-    // Phase 1: Blocking initialization (no event processing)
-    if (perform_initialization() < 0) {
-        log_err("Initialization failed");
-        return 1;
-    }
+    if (perform_initialization() < 0) { log_err("Initialization failed"); return 1; }
 
-    // Phase 2: Start event-driven runtime
     epfd = epoll_create1(0);
-    if (epfd < 0) {
-        log_err("epoll_create1 failed: %s", strerror(errno));
-        return 1;
+    if (epfd < 0) { log_err("epoll_create1: %s", strerror(errno)); return 1; }
+
+    /* timerfd: fire every 5s for metrics + alert */
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (timer_fd >= 0) {
+        struct itimerspec its = {{5, 0}, {5, 0}};
+        timerfd_settime(timer_fd, 0, &its, NULL);
+        struct epoll_event ev = { .events = EPOLLIN, .data.fd = timer_fd };
+        epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev);
     }
 
-    if (netlink_start(epfd) < 0) {
-        log_err("netlink_start failed");
-        return 1;
-    }
-    if (cli_start(epfd) < 0) {
-        log_err("cli_start failed");
-        return 1;
-    }
+    if (netlink_start(epfd) < 0) { log_err("netlink_start failed"); return 1; }
+    if (cli_start(epfd) < 0) { log_err("cli_start failed"); return 1; }
+    if (prometheus_start(epfd) < 0)
+        log_warn("prometheus exporter not available");
 
-    // Phase 2.5: SPSC event queue + worker thread
     event_queue_t eq;
-    if (event_queue_init(&eq) < 0) {
-        log_err("event_queue_init failed");
-        return 1;
-    }
+    if (event_queue_init(&eq) < 0) { log_err("event_queue_init failed"); return 1; }
     netlink_set_event_queue(&eq);
+    if (event_worker_start(&eq) < 0) { log_err("event_worker_start failed"); return 1; }
 
-    if (event_worker_start(&eq) < 0) {
-        log_err("event_worker_start failed");
-        event_queue_destroy(&eq);
-        return 1;
-    }
-
-    const int MAX_EVENTS = 10;
+    const int MAX_EVENTS = 16;
     struct epoll_event events[MAX_EVENTS];
 
-    time_t last_metrics = 0;
     while (running) {
-        int nfds = epoll_wait(epfd, events, MAX_EVENTS, 1000); // timeout 1s
+        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (nfds < 0) {
             if (errno == EINTR) continue;
-            log_err("epoll_wait failed: %s", strerror(errno));
+            log_err("epoll_wait: %s", strerror(errno));
             break;
         }
-        for (int i = 0;i<nfds;i++) {
+        for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
-            if (fd == -1) continue;
+            if (fd < 0) continue;
+
             if (fd == netlink_fd()) {
-                // Only process Netlink messages after initialization
-                if (initialization_complete) {
-                    process_netlink_messages();
-                } else {
-                    log_info("Skipping Netlink message during initialization");
+                if (init_done) process_netlink_messages();
+            } else if (fd == timer_fd) {
+                uint64_t exp;
+                (void)!read(timer_fd, &exp, sizeof(exp));  /* drain */
+                if (init_done) {
+                    metrics_poll_once();
+                    alert_check_cycle();
                 }
-            } else if (fd == -1) {
-                // skip
+            } else if (fd == prometheus_fd()) {
+                prometheus_handle_connection();
             } else {
-                // assume cli socket or other
                 cli_handle_connection(fd);
             }
-        }
-
-        time_t now = time(NULL);
-        if (now - last_metrics >= 5) { // poll interval
-            metrics_poll_once();
-            // Only run alert checks after initialization
-            if (initialization_complete) {
-                alert_check_cycle();
-            }
-            last_metrics = now;
         }
     }
 
     log_info("nlagent exiting");
-
     event_worker_stop();
     event_queue_destroy(&eq);
+    if (timer_fd >= 0) close(timer_fd);
     close(epfd);
     return 0;
 }
