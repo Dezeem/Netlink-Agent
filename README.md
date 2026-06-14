@@ -1,71 +1,129 @@
 # Netlink-Agent
 
-`Netlink-Agent` is a Linux network state monitoring and event collection agent built on top of `Netlink + epoll`. It subscribes to kernel `NETLINK_ROUTE` events, maintains a user-space network state model, and exposes interface state through a Unix Domain Socket CLI.
-
-The goal is to evolve this project from a simple Netlink demo into an infrastructure-style Linux network monitoring agent: event-driven, low-overhead, observable, deployable, and extensible.
+`Netlink-Agent` is a Linux network monitoring daemon built on `Netlink + epoll`.
+It subscribes to kernel `NETLINK_ROUTE` events, maintains a user-space network
+state model (interfaces, addresses, routes), and exposes observability through
+a Unix Domain Socket CLI and a Prometheus `/metrics` endpoint.
 
 ## Core Capabilities
 
-- **Event-driven runtime**: uses `epoll` to handle Netlink and CLI sockets in one event loop.
-- **Kernel event subscription**: listens for link, IPv4/IPv6 address, and IPv4/IPv6 route events.
-- **User-space state model**: maintains interface status, counters, and address lists.
-- **Lightweight query interface**: exposes a Unix Domain Socket CLI without requiring an HTTP dependency.
-- **Metrics and alert foundation**: periodically refreshes RX/TX counters and emits basic warning logs.
-- **Engineering foundation**: includes `Makefile`, sample config, and a systemd service template.
+- **Event-driven daemon** — `epoll_wait(-1)` with timerfd, netlink, prometheus, and unix socket as fd sources.
+- **Kernel event subscription** — link, IPv4/IPv6 address, and IPv4/IPv6 route events.
+- **SPSC worker queue** — lock-free ring buffer decouples netlink receive from state updates with backpressure and drop tracking.
+- **User-space state model (SSOT)** — interface state, full `rtnl_link_stats64` counters, address lists, and route table.
+- **Prometheus exporter** — HTTP `/metrics` on `:9100`, standard format with HELP/TYPE annotations.
+- **Atomic config hot-reload** — double-buffer `config_t` via `SIGHUP` or CLI `reload`, sourced from environment variables.
+- **Perf benchmarks** — automated `perf stat` throughput profiling at three intensity levels.
+- **ASan + UBSan build target** — `make asan` catches misaligned access, leaks, and UB at dev time.
 
-## Architecture Overview
+## Architecture
 
 ```text
-Linux Kernel
-    |
-    | NETLINK_ROUTE events
-    v
-+------------------+
-|  Netlink Socket  |
-+------------------+
-          |
-          v
-+------------------+
-| epoll event loop |
-+------------------+
-   |            |
-   |            +----------------+
-   |                             |
-   v                             v
-Netlink parser              Unix Socket CLI
-   |                             |
-   v                             v
-+------------------+       query snapshot
-|   State Model    | <----------------+
-| iface/address    |
-| stats counters   |
-+------------------+
-   |            |
-   v            v
-metrics      alert logs
+                       Linux Kernel
+                           |
+                    NETLINK_ROUTE events
+                           |
+                    +------v------+
+                    |  epoll fd   |  timerfd (5s)
+                    |  sources    |  Prometheus :9100
+                    +-------------+  Unix Socket CLI
+                     |            |
+        recvmsg + push to queue   |
+                     |            |
+              +------v------+     |
+              | SPSC Ring   |     |
+              | Buffer (256)|     |
+              +------+------+     |
+                     |            |
+                pop + dispatch    |
+                     |            |
+              +------v------+     |
+              | Worker      |     |
+              | Thread      |     |
+              +------+------+     |
+                     |            |
+              +------v------------v------+
+              |      Parser (SSOT)       |
+              |  iface_list  route_list  |
+              |  rwlock protection       |
+              +--------------------------+
+                |       |        |
+                v       v        v
+            metrics   alert    CLI query
 ```
 
-See `ARCHITECTURE.md` for more details.
+### Data Model
+
+```text
+iface_info (linked list)
+  ├─ ifname[IFNAMSIZ], ifindex, up
+  ├─ stats: rtnl_link_stats64 (rx/tx bytes, errors, drops, ...)
+  ├─ addrs[MAX_ADDR_PER_IF]: family, prefixlen, addr[]
+  └─ next
+
+route_info (linked list)
+  ├─ dst[], prefixlen, family
+  ├─ gateway[], oif (output interface index)
+  ├─ rtm_type (unicast/local/...), rtm_protocol (kernel/boot/static/dhcp)
+  └─ next
+```
+
+### Event Flow (Sequence)
+
+```text
+epoll_wait(-1)             worker_thread              parser
+    │                          │                        │
+    ├─ netlink readable        │                        │
+    │  └─ recvmsg → nlh        │                        │
+    │     └─ nl_event_alloc()  │                        │
+    │        └─ push(queue) ──►│                        │
+    │                          ├─ pop(queue)            │
+    │                          ├─ dispatch(event)       │
+    │                          │  ├─ handle_link_msg ──►│ upsert / delete
+    │                          │  ├─ handle_addr_msg ──►│ add / del addr
+    │                          │  └─ handle_route_msg ─►│ route_upsert / delete
+    │                          ├─ record queue depth    │
+    │                          └─ free(event)           │
+    │                                                   │
+    ├─ timerfd (5s)                                     │
+    │  └─ metrics_poll_once() ─────────────────────────►│ update stats
+    │  └─ alert_check_cycle() ─────────────────────────►│ read + warn
+    │                                                   │
+    ├─ prometheus fd                                    │
+    │  └─ accept → snapshot → write → close             │
+    │                                                   │
+    └─ unix socket                                      │
+       └─ CLI accept / command handle                   │
+```
 
 ## Project Layout
 
 ```text
 Netlink-Agent/
-├── conf/
-│   └── nlagent.conf          # sample config; full config loading is planned
+├── benchmark/
+│   ├── perf_report.md         # latest perf benchmark report
+│   └── stress_log.md          # performance baseline
+├── tests/
+│   ├── stress_test.sh         # parameterized stress test (veth / addr / CLI)
+│   └── perf_bench.sh          # 3-tier perf stat benchmark
 ├── src/
-│   ├── main.c                # entry point, initialization, epoll loop
-│   ├── netlink.c/.h          # Netlink socket and event parsing
-│   ├── parser.c/.h           # user-space interface state model
-│   ├── metrics.c/.h          # periodic metrics refresh entry
-│   ├── alert.c/.h            # basic alert checks
-│   ├── cli.c/.h              # Unix Socket CLI
-│   └── logger.c/.h           # logging helpers
+│   ├── main.c                 # entry, init, epoll loop, signal handling
+│   ├── netlink.c/.h           # netlink socket, event parsing, dispatch
+│   ├── parser.c/.h            # SSOT state model (iface + addr + route)
+│   ├── event_queue.c/.h       # SPSC lock-free ring buffer
+│   ├── event_worker.c/.h      # worker thread (pop → dispatch → free)
+│   ├── metrics.c/.h           # periodic stats refresh trigger
+│   ├── alert.c/.h             # error / traffic threshold checks
+│   ├── cli.c/.h               # Unix Domain Socket CLI
+│   ├── prom.c/.h              # Prometheus HTTP exporter (:9100)
+│   ├── config.c/.h            # atomic double-buffer config (SIGHUP reload)
+│   ├── runtime_metrics.c/.h   # event / depth / drop / worker counters
+│   └── logger.c/.h            # timestamped stdout logger
+├── conf/
+│   └── nlagent.conf           # sample config
 ├── systemd/
-│   └── nlagent.service       # systemd service template
+│   └── nlagent.service        # systemd unit template
 ├── Makefile
-├── README.md
-├── README.zh-CN.md
 └── LICENSE
 ```
 
@@ -74,18 +132,12 @@ Netlink-Agent/
 ### Build
 
 ```bash
-make
-```
-
-Output:
-
-```text
-build/nlagent
+make          # release (-O2)
+make debug    # debug (-O0 -DDEBUG)
+make asan     # AddressSanitizer + UBSan
 ```
 
 ### Run
-
-`Netlink-Agent` reads Linux network state, so running with root privileges is recommended:
 
 ```bash
 sudo ./build/nlagent
@@ -105,82 +157,102 @@ nc -U /tmp/nlagent.sock
 
 Available commands:
 
-| Command | Description |
-|---|---|
-| `show interfaces` | Show all interface states, counters, and addresses |
-| `list` | Alias of `show interfaces` |
-| `help` | Show help |
-| `quit` / `exit` | Close the current connection |
+| Command                    | Description                         |
+|---|-------------------------------------|
+| `show interfaces`, `list`  | All interface states, counters, addresses |
+| `show interface <ifname>`  | Single interface detail             |
+| `show routes`              | Route table (dst, proto, gateway, oif) |
+| `show metrics`             | Runtime counters and queue depth    |
+| `reload`                   | Hot-reload config from environment  |
+| `help`                     | Show help                           |
+| `quit`, `exit`             | Close connection                    |
 
-Example:
+Example — routes:
 
 ```bash
 $ nc -U /tmp/nlagent.sock
-=== Netlink Agent CLI ===
-Available commands:
-  show interfaces, list - Display interface status
-  help - Show this help message
-  quit, exit - Close connection
+> show routes
+=== Route Table (13 entries) ===
+Destination          Proto   Gateway          OIF
+ff00::/8             kernel  *                eth0
+fe80::/64            kernel  *                eth0
+::1/128              kernel  *                lo
+192.168.16.0/20      kernel  *                eth0
+0.0.0.0/0            dhcp    192.168.16.1     eth0
+...
+```
 
-> show interfaces
-=== Network Interfaces (2) ===
-Interface: eth0
-  Index: 2, Status: UP
-  Counters: RX=3534918288 TX=2293304849 RX_ERR=0 TX_ERR=0
-  Addresses (2):
-    [1] 10.4.4.10/24 (IPv4)
-    [2] fe80::1/64 (IPv6)
+Example — metrics:
 
-Interface: lo
-  Index: 1, Status: UP
-  Counters: RX=147969624 TX=147969624 RX_ERR=0 TX_ERR=0
-  Addresses (2):
-    [1] 127.0.0.1/8 (IPv4)
-    [2] ::1/128 (IPv6)
+```bash
+> show metrics
+=== Runtime Metrics ===
+netlink_events_total 4048
+  link_events 1508
+  addr_events 141
+  route_events 2399
+netlink_dropped_total 487
+worker_events_total 4048
+queue_depth_current 0
+queue_depth_max 255
+backpressure_pct 12.0%
+...
+```
+
+### Prometheus
+
+```bash
+curl http://localhost:9100/metrics
+```
+
+### Config Hot-Reload
+
+```bash
+# Via CLI
+echo reload | nc -U /tmp/nlagent.sock
+
+# Via signal
+sudo kill -HUP $(pgrep nlagent)
+
+# Override thresholds at reload time
+NLAGENT_ERR_THRESHOLD=5 NLAGENT_TRAFFIC_MBPS=20 systemctl reload nlagent
+```
+
+### Stress Test
+
+```bash
+# Interactive stress (15s, 200 veth pairs, 50 addrs, 30 CLI clients)
+sudo bash tests/stress_test.sh -d 15 -v 200 -a 50 -c 30
+
+# Perf benchmark (3-tier automated profiling)
+sudo bash tests/stress_test.sh -p
 ```
 
 ## Technical Highlights
 
-### 1. Netlink-driven event collection
-
-The agent listens to `NETLINK_ROUTE` directly instead of periodically shelling out to `ip addr`, reducing latency and overhead.
-
-### 2. epoll-based event loop
-
-The runtime handles Netlink and CLI events in a single `epoll` loop, which is a better fit for lightweight system agents than one-thread-per-connection designs.
-
-### 3. User-space state model
-
-The `parser` module acts as the central state model for interface state, addresses, and counters. CLI, metrics, and alert logic all read from this state model.
-
-### 4. Snapshot-based CLI query
-
-CLI output is generated from a copied state snapshot, reducing coupling between query logic and the underlying linked-list state.
+- **Pure event-driven epoll** — `epoll_wait(-1)` blocks until a real fd event fires. No polling, no timeout hacks, every I/O and timer is an fd.
+- **SPSC lock-free queue** — ring buffer decouples `recvmsg` from handler dispatch. 256 slots, atomic head/tail, backpressure with drop counting visible in metrics.
+- **Unified state model (SSOT)** — `parser.c` owns interface and route state under `pthread_rwlock_t`. Every other module reads through the parser API.
+- **Atomic config reload** — double-buffer `config_t` swapped via `_Atomic(config_t *)`. Zero-downtime reload, safe concurrent reads in alert and dispatch paths.
+- **Observability built in** — Prometheus endpoint, runtime metrics, structured log levels (INFO/WARN/ERROR), and automated `perf stat` profiling.
+- **Sanitizer CI-ready** — `make asan` compiles with AddressSanitizer + UBSan. Validated zero-leak startup-shutdown cycle under `valgrind`.
 
 ## Current Boundaries
 
-Some foundations already exist but still need further engineering work:
-
-- `conf/nlagent.conf` is currently a sample config; full config loading is planned.
-- `systemd/nlagent.service` and `make install` need path alignment.
-- Netlink, CLI, and state cleanup paths can be further hardened.
-- Runtime metrics, JSON output, Prometheus exporter, and queue-based decoupling are planned improvements.
+- Config is sourced from environment variables; file-based parser is a planned addition.
+- The route table grows unbounded under heavy churn (no LRU eviction).
+- Alert thresholds are reactive-only; no hysteresis or rate-limiting on warnings.
+- ARM alignment safety relies on `memcpy` in the netlink-stats path (verified by UBSan).
 
 ## Roadmap
 
-The project should go deeper around performance, observability, and engineering stability:
-
-1. Add graceful shutdown: close fds, unlink socket, and release state.
-2. Add config loading with `-c /path/to/nlagent.conf`.
-3. Align `make install` with the systemd service template.
-4. Harden non-blocking `epoll` handling: drain loops, accept/read loops, and error paths.
-5. Clarify state-model locking boundaries and keep `parser` as the SSOT.
-6. Handle interface lifecycle correctly: `RTM_NEWLINK` update/create, `RTM_DELLINK` delete.
-7. Add runtime metrics and expose them via CLI `show metrics`.
-8. Extend CLI with `show interface <name>` and JSON output.
-9. Introduce a bounded ring buffer to decouple Netlink receiving from state updates.
-10. Add stress tests, sanitizer, valgrind, and CI.
+1. File-based config as primary source, env vars as override (`/etc/nlagent.conf`).
+2. Route-table LRU eviction for high-churn environments.
+3. Alert deduplication and hysteresis.
+4. `json` output mode for CLI.
+5. `make install` path alignment with systemd unit.
+6. CI workflow (build + asan + stress + valgrind).
 
 ## License
 
-This project is licensed under the MIT License. See `LICENSE` for details.
+MIT License. See `LICENSE` for details.
