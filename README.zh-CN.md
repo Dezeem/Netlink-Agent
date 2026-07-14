@@ -1,71 +1,129 @@
 # Netlink-Agent
 
-`Netlink-Agent` 是一个基于 `Netlink + epoll` 的 Linux 网络状态监控与事件采集 Agent。它订阅内核 `NETLINK_ROUTE` 事件，将链路、地址和路由变化转化为用户态网络状态模型，并通过 Unix Domain Socket CLI 提供查询能力。
-
-项目目标不是做一个“能监听 Netlink 的 demo”，而是逐步演进为一个具备基础设施味道的 Linux 网络监控 Agent：事件驱动、低开销、可观测、可部署、可扩展。
+`Netlink-Agent` 是一个基于 `Netlink + epoll` 的 Linux 网络监控守护进程。
+它订阅内核 `NETLINK_ROUTE` 事件，维护用户态网络状态模型（接口、地址、路由），
+并通过 Unix Domain Socket CLI 和 Prometheus `/metrics` 端点暴露可观测性。
 
 ## 核心能力
 
-- **事件驱动**：基于 `epoll` 统一处理 Netlink socket 与 CLI socket。
-- **内核事件监听**：订阅 link、IPv4/IPv6 address、IPv4/IPv6 route 事件。
-- **用户态状态模型**：维护接口状态表，记录接口索引、UP/DOWN 状态、统计计数器与地址列表。
-- **低开销查询接口**：通过 Unix Domain Socket 暴露 CLI，无需引入额外 HTTP 依赖。
-- **指标刷新与告警**：周期性刷新接口 RX/TX 统计，并对错误计数和高流量进行基础告警。
-- **工程化基础**：提供 `Makefile`、示例配置和 systemd 服务模板。
+- **事件驱动守护进程** — `epoll_wait(-1)`，timerfd、netlink、prometheus、unix socket 统一为 fd 事件源。
+- **内核事件订阅** — 监听 link、IPv4/IPv6 address、IPv4/IPv6 route 事件。
+- **SPSC 工作队列** — 无锁环形缓冲区解耦 Netlink 接收与状态更新，带 backpressure 丢弃统计。
+- **用户态状态模型（SSOT）** — 接口状态、完整 `rtnl_link_stats64` 计数器、地址列表、路由表。
+- **Prometheus 导出** — HTTP `/metrics` on `:9100`，标准格式带 HELP/TYPE 注解。
+- **原子配置热加载** — 双缓冲 `config_t`，`SIGHUP` 或 CLI `reload` 触发，环境变量覆盖。
+- **Perf 基准测试** — 自动化 `perf stat` 吞吐量分析，三级强度。
+- **ASan + UBSan 构建目标** — `make asan` 在开发阶段捕获未对齐访问、泄漏和未定义行为。
 
-## 架构概览
+## 架构
 
-```text
-Linux Kernel
-    |
-    | NETLINK_ROUTE events
-    v
-+------------------+
-|  Netlink Socket  |
-+------------------+
-          |
-          v
-+------------------+
-| epoll event loop |
-+------------------+
-   |            |
-   |            +----------------+
-   |                             |
-   v                             v
-Netlink parser              Unix Socket CLI
-   |                             |
-   v                             v
-+------------------+       query snapshot
-|   State Model    | <----------------+
-| iface/address    |
-| stats counters   |
-+------------------+
-   |            |
-   v            v
-metrics      alert logs
+```mermaid
+flowchart TD
+    K[Linux Kernel] -->|NETLINK_ROUTE 事件| E[epoll fd<br/>事件源]
+    E -.-> T[timerfd 5s]
+    E -.-> P[Prometheus :9100]
+    E -.-> C[Unix Socket CLI]
+    E --> R[recvmsg + push 到队列]
+    R --> Q[SPSC 环形缓冲区 256]
+    Q --> W[pop + dispatch]
+    W --> WT[Worker 线程]
+    WT --> PS[Parser SSOT<br/>iface_list / route_list<br/>rwlock 保护]
+    PS --> M[metrics]
+    PS --> A[alert]
+    PS --> Q2[CLI 查询]
 ```
 
-更多架构说明见 `ARCHITECTURE.md`。
+### 数据模型
+
+```mermaid
+classDiagram
+    class iface_info {
+        +char ifname[IFNAMSIZ]
+        +int ifindex
+        +bool up
+        +rtnl_link_stats64 stats
+        +addr_entry addrs[MAX_ADDR_PER_IF]
+        +iface_info* next
+    }
+    class addr_entry {
+        +int family
+        +int prefixlen
+        +addr_t addr[]
+    }
+    class route_info {
+        +dst[]
+        +int prefixlen
+        +int family
+        +gateway[]
+        +int oif
+        +rtm_type
+        +rtm_protocol
+        +route_info* next
+    }
+    iface_info "1" --> "0..*" addr_entry : 包含
+    iface_info --> iface_info : next 链表
+    route_info --> route_info : next 链表
+```
+
+### 时序图
+
+```mermaid
+sequenceDiagram
+    participant EP as epoll_wait(-1)
+    participant WK as worker_thread
+    participant PR as parser
+
+    Note over EP: netlink 可读
+    EP->>EP: recvmsg → nlh
+    EP->>EP: nl_event_alloc()
+    EP->>WK: push(queue)
+    WK->>WK: pop(queue)
+    WK->>WK: dispatch(event)
+    WK->>PR: handle_link_msg → upsert / delete
+    WK->>PR: handle_addr_msg → add / del addr
+    WK->>PR: handle_route_msg → route_upsert / delete
+    WK->>WK: record queue depth
+    WK->>WK: free(event)
+
+    Note over EP: timerfd 5s
+    EP->>PR: metrics_poll_once() 更新统计
+    EP->>PR: alert_check_cycle() 读取 + 告警
+
+    Note over EP: prometheus fd
+    EP->>EP: accept → snapshot → write → close
+
+    Note over EP: unix socket
+    EP->>EP: CLI accept / 命令分发
+```
 
 ## 目录结构
 
 ```text
 Netlink-Agent/
-├── conf/
-│   └── nlagent.conf          # 示例配置，当前配置化能力待完善
+├── benchmark/
+│   ├── perf_report.md         # 最新 perf 基准报告
+│   └── stress_log.md          # 性能基线
+├── tests/
+│   ├── stress_test.sh         # 参数化压力测试 (veth / addr / CLI)
+│   └── perf_bench.sh          # 三级 perf stat 基准测试
 ├── src/
-│   ├── main.c                # 入口、初始化、epoll 主循环
-│   ├── netlink.c/.h          # Netlink socket 与事件解析
-│   ├── parser.c/.h           # 用户态接口状态模型
-│   ├── metrics.c/.h          # 周期性指标刷新入口
-│   ├── alert.c/.h            # 基础告警检查
-│   ├── cli.c/.h              # Unix Socket CLI
-│   └── logger.c/.h           # 日志输出
+│   ├── main.c                 # 入口、初始化、epoll 循环、信号处理
+│   ├── netlink.c/.h           # netlink socket、事件解析、dispatch
+│   ├── parser.c/.h            # SSOT 状态模型 (接口 + 地址 + 路由)
+│   ├── event_queue.c/.h       # SPSC 无锁环形缓冲区
+│   ├── event_worker.c/.h      # 工作线程 (pop → dispatch → free)
+│   ├── metrics.c/.h           # 周期性统计刷新触发器
+│   ├── alert.c/.h             # 错误/流量阈值检测
+│   ├── cli.c/.h               # Unix Domain Socket CLI
+│   ├── prom.c/.h              # Prometheus HTTP 导出 (:9100)
+│   ├── config.c/.h            # 原子双缓冲配置 (SIGHUP 热加载)
+│   ├── runtime_metrics.c/.h   # 事件/深度/丢弃/worker 计数器
+│   └── logger.c/.h            # 带时间戳的 stdout 日志
+├── conf/
+│   └── nlagent.conf           # 示例配置
 ├── systemd/
-│   └── nlagent.service       # systemd 服务模板
+│   └── nlagent.service        # systemd 单元模板
 ├── Makefile
-├── README.md
-├── README.zh-CN.md
 └── LICENSE
 ```
 
@@ -74,18 +132,12 @@ Netlink-Agent/
 ### 构建
 
 ```bash
-make
-```
-
-构建产物：
-
-```text
-build/nlagent
+make          # 发行版 (-O2)
+make debug    # 调试版 (-O0 -DDEBUG)
+make asan     # AddressSanitizer + UBSan
 ```
 
 ### 运行
-
-`Netlink-Agent` 需要访问内核网络状态，建议使用 root 权限运行：
 
 ```bash
 sudo ./build/nlagent
@@ -105,82 +157,102 @@ nc -U /tmp/nlagent.sock
 
 可用命令：
 
-| 命令 | 说明 |
-|---|---|
-| `show interfaces` | 显示所有接口状态、统计计数器和地址列表 |
-| `list` | `show interfaces` 的别名 |
-| `help` | 显示帮助 |
-| `quit` / `exit` | 关闭当前连接 |
+| 命令                       | 说明                                |
+|---|-------------------------------------|
+| `show interfaces`, `list`  | 所有接口状态、统计计数器和地址         |
+| `show interface <ifname>`  | 单个接口详情                         |
+| `show routes`              | 路由表 (目的网络、协议、网关、出接口)  |
+| `show metrics`             | 运行时计数器和队列深度                |
+| `reload`                   | 从环境变量热加载配置                  |
+| `help`                     | 显示帮助                             |
+| `quit`, `exit`             | 关闭连接                             |
 
-示例：
+示例 — 路由表：
 
 ```bash
 $ nc -U /tmp/nlagent.sock
-=== Netlink Agent CLI ===
-Available commands:
-  show interfaces, list - Display interface status
-  help - Show this help message
-  quit, exit - Close connection
-
-> show interfaces
-=== Network Interfaces (2) ===
-Interface: eth0
-  Index: 2, Status: UP
-  Counters: RX=3534918288 TX=2293304849 RX_ERR=0 TX_ERR=0
-  Addresses (2):
-    [1] 10.4.4.10/24 (IPv4)
-    [2] fe80::1/64 (IPv6)
-
-Interface: lo
-  Index: 1, Status: UP
-  Counters: RX=147969624 TX=147969624 RX_ERR=0 TX_ERR=0
-  Addresses (2):
-    [1] 127.0.0.1/8 (IPv4)
-    [2] ::1/128 (IPv6)
+> show routes
+=== Route Table (13 entries) ===
+Destination          Proto   Gateway          OIF
+ff00::/8             kernel  *                eth0
+fe80::/64            kernel  *                eth0
+::1/128              kernel  *                lo
+192.168.16.0/20      kernel  *                eth0
+0.0.0.0/0            dhcp    192.168.16.1     eth0
+...
 ```
 
-## 当前技术亮点
+示例 — 运行时指标：
 
-### 1. Netlink 事件驱动
+```bash
+> show metrics
+=== Runtime Metrics ===
+netlink_events_total 4048
+  link_events 1508
+  addr_events 141
+  route_events 2399
+netlink_dropped_total 487
+worker_events_total 4048
+queue_depth_current 0
+queue_depth_max 255
+backpressure_pct 12.0%
+...
+```
 
-项目直接监听内核 `NETLINK_ROUTE`，相比周期性执行 `ip addr` 或读取命令输出，具备更低延迟和更低开销。
+### Prometheus
 
-### 2. epoll 单线程事件循环
+```bash
+curl http://localhost:9100/metrics
+```
 
-主循环统一处理 Netlink 与 CLI 事件，避免为每个连接创建线程，适合作为轻量级系统 Agent 的基础模型。
+### 配置热加载
 
-### 3. 用户态状态模型
+```bash
+# 通过 CLI
+echo reload | nc -U /tmp/nlagent.sock
 
-`parser` 模块维护接口状态表，CLI、metrics 和 alert 都围绕这份状态模型工作，避免各模块重复采集系统状态。
+# 通过信号
+sudo kill -HUP $(pgrep nlagent)
 
-### 4. 快照式 CLI 查询
+# 重载时覆盖阈值
+NLAGENT_ERR_THRESHOLD=5 NLAGENT_TRAFFIC_MBPS=20 systemctl reload nlagent
+```
 
-CLI 查询通过状态表快照输出接口信息，减少查询逻辑与底层链表状态的耦合。
+### 压力测试
+
+```bash
+# 交互式压测 (15s, 200 veth, 50 addr, 30 CLI 并发)
+sudo bash tests/stress_test.sh -d 15 -v 200 -a 50 -c 30
+
+# Perf 基准 (三级自动化分析)
+sudo bash tests/stress_test.sh -p
+```
+
+## 技术亮点
+
+- **纯事件驱动 epoll** — `epoll_wait(-1)` 阻塞直到真实 fd 事件到达。零轮询，零超时 hack，所有 I/O 和定时器都是 fd。
+- **SPSC 无锁队列** — 环形缓冲区解耦 `recvmsg` 与 handler 分发。256 槽位，原子 head/tail，backpressure 丢弃统计可在 metrics 中可见。
+- **统一状态模型（SSOT）** — `parser.c` 在 `pthread_rwlock_t` 下持有接口和路由状态，所有其他模块通过 parser API 读取。
+- **原子配置热加载** — 双缓冲 `config_t` 通过 `_Atomic(config_t *)` 原子交换。零停机重载，告警和分发路径中的并发读取安全。
+- **内建可观测性** — Prometheus 端点、运行时指标、结构化日志（INFO/WARN/ERROR）、自动化 `perf stat` 分析。
+- **Sanitizer CI 就绪** — `make asan` 编译带 AddressSanitizer + UBSan。已通过 valgrind 零泄漏启动-关闭循环验证。
 
 ## 当前边界
 
-以下能力已经有基础文件或雏形，但仍需继续工程化：
-
-- `conf/nlagent.conf` 当前是示例配置，代码尚未完整加载。
-- `systemd/nlagent.service` 与 `make install` 的安装路径需要对齐。
-- Netlink、CLI、状态表的异常路径和资源清理还可以继续加强。
-- 运行时 metrics、JSON 输出、Prometheus exporter、消息队列解耦属于后续演进方向。
+- 配置从环境变量读取；基于文件的配置解析器尚未实现。
+- 路由表在高频变更场景下无限增长（无 LRU 淘汰）。
+- 告警阈值仅被动触发；无 hysteresis 或 rate-limiting。
+- ARM 对齐安全依赖 netlink 统计路径中的 `memcpy`（UBSan 已验证通过）。
 
 ## 路线图
 
-优先围绕“高性能 + 可观测 + 工程稳定性”做深：
-
-1. 完善 graceful shutdown，关闭 fd、删除 socket、释放状态表。
-2. 实现配置化，支持 `-c /path/to/nlagent.conf`。
-3. 对齐 `Makefile install` 与 `systemd` 部署路径。
-4. 强化 non-blocking + epoll 细节，完善 drain、accept/read 循环和异常处理。
-5. 整理状态模型锁边界，明确 `parser` 作为 SSOT。
-6. 正确处理接口生命周期，区分 `RTM_NEWLINK` 与 `RTM_DELLINK`。
-7. 增加运行时 metrics，并通过 CLI 输出 `show metrics`。
-8. 增强 CLI：`show interface <name>`、JSON 输出。
-9. 引入有界 ring buffer 解耦 Netlink 接收与状态更新。
-10. 补充压测、sanitizer、valgrind 和 CI。
+1. 文件配置作为主源，环境变量作为覆盖 (`/etc/nlagent.conf`)。
+2. 高频场景下的路由表 LRU 淘汰。
+3. 告警去重与 hysteresis。
+4. CLI `json` 输出模式。
+5. `make install` 与 systemd 单元路径对齐。
+6. CI 工作流 (build + asan + stress + valgrind)。
 
 ## 许可证
 
-本项目采用 MIT 许可证，详情见 `LICENSE`。
+MIT License。详见 `LICENSE`。
