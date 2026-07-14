@@ -8,11 +8,13 @@
 #   -a <数量>  地址增删每轮数量 (默认: 50, 设为0关闭)
 #   -c <数量>  CLI 短连接并发数 (默认: 30, 设为0关闭)
 #   -l <0|1>   CLI 长连接压测 (默认: 1=开启, 0=关闭)
+#   -p         跑 perf benchmark (三级强度 + perf stat 报告)
 #   -h         显示帮助
 #
 # 示例:
 #   sudo bash tests/stress_test.sh                    # 默认参数
 #   sudo bash tests/stress_test.sh -d 120 -v 500      # 2 分钟 veth 风暴
+#   sudo bash tests/stress_test.sh -p                 # perf 基准测试
 #   sudo bash tests/stress_test.sh -v 0 -a 0 -l 0 -c 50  # 纯 CLI 压测
 
 set -euo pipefail
@@ -23,18 +25,26 @@ VETH_BATCH=200
 ADDR_BATCH=50
 CLI_CONCURRENT=30
 CLI_LONG=1
+PERF_MODE=0
 
-while getopts "d:v:a:c:l:h" opt; do
+while getopts "d:v:a:c:l:ph" opt; do
     case "$opt" in
         d) DURATION="$OPTARG"  ;;
         v) VETH_BATCH="$OPTARG" ;;
         a) ADDR_BATCH="$OPTARG" ;;
         c) CLI_CONCURRENT="$OPTARG" ;;
         l) CLI_LONG="$OPTARG"   ;;
+        p) PERF_MODE=1          ;;
         h) sed -n '2,/^$/p' "$0" | sed 's/^# //'; exit 0 ;;
         *) exit 1 ;;
     esac
 done
+
+# perf mode: delegate to perf_bench.sh
+if [ "$PERF_MODE" -eq 1 ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    exec bash "$SCRIPT_DIR/perf_bench.sh"
+fi
 
 END=$((SECONDS + DURATION))
 
