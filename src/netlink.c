@@ -217,7 +217,13 @@ static void handle_route_msg(struct nlmsghdr *nlh) {
         else if (rt->rtm_family == AF_INET6)
             inet_ntop(AF_INET6, addr, dst, sizeof(dst));
     } else {
-        strcpy(dst, "0.0.0.0");
+        /* Default route – kernel omits RTA_DST.  Use the correct
+         * all-zeros representation so that upsert and delete always
+         * agree, regardless of whether the kernel includes RTA_DST. */
+        if (rt->rtm_family == AF_INET6)
+            strcpy(dst, "::");
+        else
+            strcpy(dst, "0.0.0.0");
     }
 
     /* Gateway */
