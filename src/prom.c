@@ -18,6 +18,14 @@ static int prom_sock = -1;
 
 int prometheus_fd(void) { return prom_sock; }
 
+void prometheus_stop(void)
+{
+    if (prom_sock >= 0) {
+        close(prom_sock);
+        prom_sock = -1;
+    }
+}
+
 int prometheus_start(int epoll_fd)
 {
     prom_sock = socket(AF_INET, SOCK_STREAM, 0);

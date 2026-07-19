@@ -143,8 +143,20 @@ int main(int argc, char **argv)
     }
 
     log_info("nlagent exiting");
+
+    /* Phase 1: stop event pipeline */
     event_worker_stop();
     event_queue_destroy(&eq);
+
+    /* Phase 2: close I/O sources (epfd is still alive) */
+    netlink_stop();
+    cli_stop();
+    prometheus_stop();
+
+    /* Phase 3: release data structures */
+    cleanup_iface_table();
+
+    /* Phase 4: close infrastructure fds (epfd last) */
     if (timer_fd >= 0) close(timer_fd);
     close(epfd);
     close(sigfd);

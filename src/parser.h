@@ -53,6 +53,7 @@ void iface_list_unlock(void);
 extern iface_info_t *iface_list;
 
 void init_iface_table(void);
+void cleanup_iface_table(void);
 iface_info_t *get_iface_by_index(int ifindex);
 iface_info_t *get_iface_by_name(const char *ifname);
 void update_iface_status(int ifindex, int up);

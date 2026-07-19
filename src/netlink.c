@@ -22,6 +22,14 @@
 static int nl_sock = -1;
 int netlink_fd(void) { return nl_sock; }
 
+void netlink_stop(void)
+{
+    if (nl_sock >= 0) {
+        close(nl_sock);
+        nl_sock = -1;
+    }
+}
+
 /* event queue (producer side: epoll thread pushes here) */
 static event_queue_t *nl_event_queue = NULL;
 

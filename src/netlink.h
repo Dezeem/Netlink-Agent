@@ -3,7 +3,8 @@
 
 #include "event_queue.h"
 
-int netlink_start(int epoll_fd);
+int  netlink_start(int epoll_fd);
+void netlink_stop(void);
 
 /* Link the producer to the event queue (called once before the event loop) */
 void netlink_set_event_queue(event_queue_t *q);

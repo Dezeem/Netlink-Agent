@@ -136,6 +136,24 @@ int cli_start(int epoll_fd) {
     return cli_sock;
 }
 
+void cli_stop(void)
+{
+    /* Close all active client connections */
+    while (cli_connections) {
+        cli_conn_free(cli_connections);
+    }
+
+    /* Close listening socket */
+    if (cli_sock >= 0) {
+        close(cli_sock);
+        cli_sock = -1;
+    }
+
+    /* Remove socket file */
+    unlink(CLI_SOCKET_PATH);
+    cli_epoll_fd = -1;
+}
+
 // Send welcome message and prompt
 static void send_welcome_prompt(int conn) {
     const char *welcome = "=== Netlink Agent CLI ===\n"
