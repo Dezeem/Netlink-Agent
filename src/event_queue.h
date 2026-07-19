@@ -18,11 +18,14 @@ typedef struct nl_event {
 #define EVENT_QUEUE_CAPACITY 256
 
 typedef struct {
-    _Atomic uint64_t  head;    /* producer index */
-    _Atomic uint64_t  tail;    /* consumer index */
-    uint64_t          mask;    /* CAPACITY - 1 */
-    nl_event_t      **slots;   /* array[CAPACITY] */
+    _Atomic uint64_t  head;      /* producer index */
+    _Atomic uint64_t  tail;      /* consumer index */
+    uint64_t          mask;      /* CAPACITY - 1 */
+    nl_event_t      **slots;     /* array[CAPACITY] */
+    int               notify_fd; /* eventfd for worker wakeup */
 } event_queue_t;
+
+int event_queue_get_notify_fd(const event_queue_t *q);
 
 int          event_queue_init(event_queue_t *q);
 void         event_queue_destroy(event_queue_t *q);

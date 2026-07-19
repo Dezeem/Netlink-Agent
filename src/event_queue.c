@@ -2,6 +2,9 @@
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/eventfd.h>
+#include <errno.h>
 #include <linux/netlink.h>
 
 /* Queue management */
@@ -15,6 +18,14 @@ int event_queue_init(event_queue_t *q)
     atomic_init(&q->head, 0);
     atomic_init(&q->tail, 0);
     q->mask = EVENT_QUEUE_CAPACITY - 1;
+
+    q->notify_fd = eventfd(0, 0);
+    if (q->notify_fd < 0) {
+        log_err("failed to create eventfd: %s", strerror(errno));
+        free(q->slots);
+        q->slots = NULL;
+        return -1;
+    }
     return 0;
 }
 
@@ -28,6 +39,10 @@ void event_queue_destroy(event_queue_t *q)
     }
     free(q->slots);
     q->slots = NULL;
+    if (q->notify_fd >= 0) {
+        close(q->notify_fd);
+        q->notify_fd = -1;
+    }
 }
 
 /* SPSC producer */
@@ -41,6 +56,11 @@ bool event_queue_push(event_queue_t *q, nl_event_t *event)
 
     q->slots[head & q->mask] = event;
     atomic_store_explicit(&q->head, head + 1, memory_order_release);
+
+    /* Wake the worker (best-effort; ignored on overflow) */
+    uint64_t one = 1;
+    (void)!write(q->notify_fd, &one, sizeof(one));
+
     return true;
 }
 
@@ -71,6 +91,11 @@ uint64_t event_queue_depth(const event_queue_t *q)
     uint64_t head = atomic_load_explicit(&q->head, memory_order_acquire);
     uint64_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
     return head - tail;
+}
+
+int event_queue_get_notify_fd(const event_queue_t *q)
+{
+    return q->notify_fd;
 }
 
 /* nl_event factory */

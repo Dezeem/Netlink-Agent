@@ -3,7 +3,9 @@
 #include "logger.h"
 #include "runtime_metrics.h"
 #include <stdlib.h>
-#include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <linux/rtnetlink.h>
 
 /* Forward: netlink dispatcher */
@@ -14,40 +16,51 @@ static event_queue_t *g_queue  = NULL;
 static pthread_t      g_thread = 0;
 static volatile int   g_running = 0;
 
+/* Drain every event currently in the queue */
+static void worker_drain(event_queue_t *q)
+{
+    for (;;) {
+        nl_event_t *event = event_queue_pop(q);
+        if (!event) break;
+        if (event->nlmsg_type == 0) {
+            free(event);
+            continue;
+        }
+        runtime_metrics_inc_worker_event();
+        runtime_metrics_record_queue_depth(event_queue_depth(q));
+        netlink_dispatch_event(event);
+        free(event);
+    }
+}
+
 /* Worker main */
 static void *worker_main(void *arg)
 {
     (void)arg;
     event_queue_t *q = g_queue;
-    struct timespec idle = { .tv_sec = 0, .tv_nsec = 100000 }; /* 100 µs */
+    int efd = event_queue_get_notify_fd(q);
 
     log_info("event worker thread started");
 
     while (g_running) {
-        nl_event_t *event = event_queue_pop(q);
-        if (event) {
-            if (event->nlmsg_type == 0) {
-                free(event);
-                continue;
-            }
-            runtime_metrics_inc_worker_event();
-            runtime_metrics_record_queue_depth(event_queue_depth(q));
-            netlink_dispatch_event(event);
-            free(event);
-        } else {
-            nanosleep(&idle, NULL);
+        /* Drain everything currently queued */
+        worker_drain(q);
+
+        if (!g_running) break;
+
+        /* Block until producer signals new data via eventfd */
+        uint64_t v;
+        ssize_t n = read(efd, &v, sizeof(v));
+        if (n != sizeof(v)) {
+            if (errno == EINTR) continue;
+            log_err("eventfd read failed: %s", strerror(errno));
+            break;
         }
     }
 
     /* Graceful drain – consume everything still in flight */
     log_info("event worker draining remaining events...");
-    while (1) {
-        nl_event_t *event = event_queue_pop(q);
-        if (!event) break;
-        if (event->nlmsg_type == 0) { free(event); break; }
-        netlink_dispatch_event(event);
-        free(event);
-    }
+    worker_drain(q);
 
     log_info("event worker thread exiting");
     return NULL;
@@ -74,10 +87,12 @@ void event_worker_stop(void)
 
     g_running = 0;
 
-    /* Push sentinel so the worker wakes up if sleeping */
-    nl_event_t *sentinel = calloc(1, sizeof(nl_event_t));
-    while (sentinel && !event_queue_push(g_queue, sentinel))
-        nanosleep(&(struct timespec){0, 100000}, NULL);
+    /* Wake worker if it's blocked on eventfd read */
+    {
+        int efd = event_queue_get_notify_fd(g_queue);
+        uint64_t one = 1;
+        (void)!write(efd, &one, sizeof(one));
+    }
 
     pthread_join(g_thread, NULL);
     g_thread = 0;
