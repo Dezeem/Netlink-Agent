@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/signalfd.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <errno.h>
@@ -28,17 +29,6 @@ static int epfd = -1;
 static int timer_fd = -1;
 static int init_done = 0;
 
-static void sig_handler(int sig)
-{
-    if (sig == SIGHUP) {
-        config_reload();
-        log_info("config reloaded via SIGHUP");
-        return;
-    }
-    log_info("received signal %d, exiting...", sig);
-    running = 0;
-}
-
 static int perform_initialization(void)
 {
     config_init_defaults();
@@ -63,9 +53,17 @@ int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
-    signal(SIGINT,  sig_handler);
-    signal(SIGTERM, sig_handler);
-    signal(SIGHUP,  sig_handler);
+    /* Block signals and deliver them via signalfd as regular epoll events.
+     * This eliminates all async-signal-unsafe code (no signal handlers). */
+    sigset_t sigmask;
+    sigemptyset(&sigmask);
+    sigaddset(&sigmask, SIGINT);
+    sigaddset(&sigmask, SIGTERM);
+    sigaddset(&sigmask, SIGHUP);
+    if (sigprocmask(SIG_BLOCK, &sigmask, NULL) < 0) {
+        perror("sigprocmask");
+        return 1;
+    }
 
     log_info("nlagent starting...");
 
@@ -73,6 +71,14 @@ int main(int argc, char **argv)
 
     epfd = epoll_create1(0);
     if (epfd < 0) { log_err("epoll_create1: %s", strerror(errno)); return 1; }
+
+    /* signalfd: deliver blocked signals as readable fd events */
+    int sigfd = signalfd(-1, &sigmask, SFD_NONBLOCK);
+    if (sigfd < 0) { log_err("signalfd: %s", strerror(errno)); return 1; }
+    {
+        struct epoll_event ev = { .events = EPOLLIN, .data.fd = sigfd };
+        epoll_ctl(epfd, EPOLL_CTL_ADD, sigfd, &ev);
+    }
 
     /* timerfd: fire every 5s for metrics + alert */
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
@@ -107,7 +113,19 @@ int main(int argc, char **argv)
             int fd = events[i].data.fd;
             if (fd < 0) continue;
 
-            if (fd == netlink_fd()) {
+            if (fd == sigfd) {
+                struct signalfd_siginfo si;
+                ssize_t n = read(sigfd, &si, sizeof(si));
+                if ((size_t)n == sizeof(si)) {
+                    if (si.ssi_signo == SIGHUP) {
+                        config_reload();
+                        log_info("config reloaded via SIGHUP");
+                    } else if (si.ssi_signo == SIGINT || si.ssi_signo == SIGTERM) {
+                        log_info("received signal %u, exiting...", si.ssi_signo);
+                        running = 0;
+                    }
+                }
+            } else if (fd == netlink_fd()) {
                 if (init_done) process_netlink_messages();
             } else if (fd == timer_fd) {
                 uint64_t exp;
@@ -129,5 +147,6 @@ int main(int argc, char **argv)
     event_queue_destroy(&eq);
     if (timer_fd >= 0) close(timer_fd);
     close(epfd);
+    close(sigfd);
     return 0;
 }
